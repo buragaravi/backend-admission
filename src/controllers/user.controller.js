@@ -545,6 +545,7 @@ const sanitizePermissions = (permissions = {}) => {
         entry.editReference = Boolean(value.editReference);
         entry.editAdmission = Boolean(value.editAdmission);
         entry.approveFeeRequest = Boolean(value.approveFeeRequest);
+          entry.requireStudentPhoto = Boolean(value.requireStudentPhoto);
         if (entry.approveFeeRequest) {
           entry.pageFeeRequests = true;
         }
