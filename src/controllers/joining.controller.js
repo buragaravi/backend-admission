@@ -1028,6 +1028,18 @@ const formatJoining = async (joiningData, pool, options = {}) => {
     }
   }
 
+  if (studentFeeDetails && Array.isArray(studentFeeDetails.lines) && studentFeeDetails.lines.length > 0) {
+    try {
+      const { connectFeeManagement } = await import('../config-mongo/feeManagement.js');
+      const conn = await connectFeeManagement();
+      const feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+      const { normalizeFeeHeadInEntries } = await import('../utils/overallConcessions.util.js');
+      studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
+    } catch (e) {
+      console.warn('[formatJoining] Failed to normalize fee heads in studentFeeDetails:', e.message);
+    }
+  }
+
   return {
     _id: joiningData.id,
     id: joiningData.id,

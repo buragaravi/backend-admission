@@ -876,6 +876,25 @@ export async function syncJoiningStudentFeeDetailsToFeeMongo({
     return { lines: [] };
   }
 
+  let conn;
+  try {
+    conn = await connectFeeManagement();
+  } catch (err) {
+    console.error('[joiningStudentFeeMongoSync] Failed to connect to Fee Management DB:', err);
+    return { lines: [] };
+  }
+  const db = conn.db;
+
+  if (studentFeeDetails && Array.isArray(studentFeeDetails.lines) && studentFeeDetails.lines.length > 0) {
+    try {
+      const feeHeads = await db.collection('feeheads').find({}).toArray();
+      const { normalizeFeeHeadInEntries } = await import('../utils/overallConcessions.util.js');
+      studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
+    } catch (e) {
+      console.warn('[syncJoiningStudentFeeDetailsToFeeMongo] Failed to normalize fee heads:', e.message);
+    }
+  }
+
   const linesIn = Array.isArray(studentFeeDetails?.lines) ? studentFeeDetails.lines : [];
   const batch =
     studentFeeDetails?.batch != null && String(studentFeeDetails.batch).trim() !== ''
@@ -892,8 +911,6 @@ export async function syncJoiningStudentFeeDetailsToFeeMongo({
   let studentFeesResult = { skipped: true, reason: 'Fee sync not attempted' };
 
   try {
-    const conn = await connectFeeManagement();
-    const db = conn.db;
 
     const catalogResult = await loadCatalogFeeStructures(db, {
       course: joiningContext?.course || '',
