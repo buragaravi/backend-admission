@@ -335,7 +335,30 @@ export const getOverallConcessions = async (req, res) => {
     }
     const revisedFees = Array.from(mergedMap.values());
 
-    if (!row && revisedFees.length === 0) {
+    let feeHeads = [];
+    try {
+      const { connectFeeManagement } = await import('../config-mongo/feeManagement.js');
+      const conn = await connectFeeManagement();
+      feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+    } catch (mongoErr) {
+      console.warn('[getOverallConcessions] Fee Mongo lookup skipped for enrichment:', mongoErr?.message);
+    }
+
+    const { resolveFeeHead } = await import('../utils/overallConcessions.util.js');
+    const enrichedRevisedFees = revisedFees.map((line) => {
+      const matched = resolveFeeHead(line, feeHeads);
+      if (matched) {
+        return {
+          ...line,
+          feeHeadId: String(matched._id || matched.id),
+          feeHeadCode: matched.code || '',
+          feeHeadName: matched.name || matched.feeHeadName || matched.headName || '',
+        };
+      }
+      return line;
+    });
+
+    if (!row && enrichedRevisedFees.length === 0) {
       return successResponse(res, {
         admissionNumber,
         revisedFees: [],
@@ -349,7 +372,7 @@ export const getOverallConcessions = async (req, res) => {
       batch: row?.batch || '',
       course: row?.course || '',
       branch: row?.branch || '',
-      revisedFees,
+      revisedFees: enrichedRevisedFees,
       updatedAt: row?.updated_at || null,
     });
   } catch (error) {

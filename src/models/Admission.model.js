@@ -84,6 +84,7 @@ const admissionSchema = new Schema(
       gender: { type: String, trim: true, default: '' },
       dateOfBirth: { type: String, trim: true, default: '' },
       notes: { type: String, trim: true, default: '' },
+      isScholarApplicable: { type: Boolean, default: false },
     },
     parents: {
       father: {

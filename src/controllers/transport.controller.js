@@ -19,6 +19,13 @@ const getActiveConnection = async () => {
   }
 };
 
+const formatStage = (stage) => ({
+  _id: stage?._id ? String(stage._id) : '',
+  stageName: stage?.stageName || '',
+  distanceFromStart: stage?.distanceFromStart ?? null,
+  fare: stage?.fare ?? null,
+});
+
 const formatRouteSummary = (doc) => ({
   _id: String(doc._id),
   routeId: doc.routeId || '',
@@ -27,13 +34,7 @@ const formatRouteSummary = (doc) => ({
   endPoint: doc.endPoint || '',
   totalDistance: doc.totalDistance ?? null,
   stageCount: Array.isArray(doc.stages) ? doc.stages.length : 0,
-});
-
-const formatStage = (stage) => ({
-  _id: stage?._id ? String(stage._id) : '',
-  stageName: stage?.stageName || '',
-  distanceFromStart: stage?.distanceFromStart ?? null,
-  fare: stage?.fare ?? null,
+  stages: Array.isArray(doc.stages) ? doc.stages.map(formatStage) : [],
 });
 
 const formatBusSummary = (doc) => ({
@@ -47,92 +48,90 @@ const formatBusSummary = (doc) => ({
 });
 
 const getBusOccupancyMap = async (db, busNumbers = [], routeIds = []) => {
-  const busStudentsMap = {};
-  const routeStudentsMap = {};
+  // Students  → transport_requests          (key: admission_number)
+  // Employees → employee_transport_requests  (key: emp_no)
+  const busStudentMap = {};
+  const busEmployeeMap = {};
+  const routeStudentMap = {};
+  const routeEmployeeMap = {};
 
-  const addRequestToMap = (busId, routeId, key) => {
-    if (busId) {
-      if (!busStudentsMap[busId]) busStudentsMap[busId] = new Set();
-      busStudentsMap[busId].add(key);
-    }
-    if (routeId) {
-      if (!routeStudentsMap[routeId]) routeStudentsMap[routeId] = new Set();
-      routeStudentsMap[routeId].add(key);
-    }
+  const addToMap = (map, id, key) => {
+    if (!id || !key) return;
+    if (!map[id]) map[id] = new Set();
+    map[id].add(key);
   };
 
-  if (db) {
+  const mongoOr = [];
+  if (routeIds.length > 0) mongoOr.push({ route_id: { $in: routeIds } });
+
+  if (db && mongoOr.length > 0) {
+    // ── Student requests ──────────────────────────────────────────────
     try {
-      const mongoOr = [];
-      if (busNumbers.length > 0) mongoOr.push({ bus_id: { $in: busNumbers } });
-      if (routeIds.length > 0) mongoOr.push({ route_id: { $in: routeIds } });
+      const studentReqs = await db
+        .collection('transport_requests')
+        .find({ status: 'approved', $or: mongoOr })
+        .project({ route_id: 1, admission_number: 1, expiry_date: 1 })
+        .toArray();
 
-      if (mongoOr.length > 0) {
-        const mongoReqs = await db
-          .collection('transport_requests')
-          .find({
-            status: { $in: ['pending', 'approved'] },
-            $or: mongoOr,
-          })
-          .project({ bus_id: 1, route_id: 1, admission_number: 1, employee_id: 1 })
-          .toArray();
-
-        for (const req of mongoReqs) {
-          const key = String(req.admission_number || req.employee_id || req._id).trim();
-          if (key) {
-            addRequestToMap(req.bus_id, req.route_id, key);
-          }
-        }
+      const now = new Date();
+      for (const req of studentReqs) {
+        const key = String(req.admission_number || '').trim();
+        if (!key) continue;
+        // If expiry_date exists and has passed, skip this record
+        // but do NOT mark it as "seen" — a newer active record for
+        // the same student may follow
+        if (req.expiry_date && new Date(req.expiry_date) < now) continue;
+        addToMap(routeStudentMap, req.route_id, key);
       }
     } catch (err) {
-      console.warn('[getBusOccupancyMap] Mongo query warning:', err?.message || err);
+      console.warn('[getBusOccupancyMap] student Mongo error:', err?.message || err);
+    }
+
+    // ── Employee requests (separate collection, key = emp_no) ─────────
+    try {
+      const empReqs = await db
+        .collection('employeetransportrequests')
+        .find({ status: 'approved', $or: mongoOr })
+        .project({ route_id: 1, emp_no: 1, expiry_date: 1 })
+        .toArray();
+
+      const now = new Date();
+      for (const req of empReqs) {
+        const key = String(req.emp_no || '').trim();
+        if (!key) continue;
+        if (req.expiry_date && new Date(req.expiry_date) < now) continue;
+        addToMap(routeEmployeeMap, req.route_id, key);
+      }
+    } catch (err) {
+      console.warn('[getBusOccupancyMap] employee Mongo error:', err?.message || err);
     }
   }
 
-  try {
-    const pool = getSecondaryPool();
-    if (pool) {
-      const sqlWhere = [];
-      const sqlParams = [];
-      if (busNumbers.length > 0) {
-        const placeholders = busNumbers.map(() => '?').join(',');
-        sqlWhere.push(`bus_id IN (${placeholders})`);
-        sqlParams.push(...busNumbers);
-      }
-      if (routeIds.length > 0) {
-        const placeholders = routeIds.map(() => '?').join(',');
-        sqlWhere.push(`route_id IN (${placeholders})`);
-        sqlParams.push(...routeIds);
-      }
+  // Secondary DB (SQL) is NOT used for live counts — MongoDB is the source of truth.
 
-      if (sqlWhere.length > 0) {
-        const [rows] = await pool.execute(
-          `SELECT bus_id, route_id, admission_number, employee_id, id FROM transport_requests WHERE status IN ('pending', 'approved') AND (${sqlWhere.join(' OR ')})`,
-          sqlParams
-        );
-        for (const r of rows) {
-          const key = String(r.admission_number || r.employee_id || r.id).trim();
-          if (key) {
-            addRequestToMap(r.bus_id, r.route_id, key);
-          }
-        }
-      }
-    }
-  } catch {
-    // Secondary DB optional
-  }
+  const toCountMap = (mapOfSets) => {
+    const out = {};
+    for (const [k, s] of Object.entries(mapOfSets)) out[k] = s.size;
+    return out;
+  };
 
-  const busCountMap = {};
-  for (const [busId, set] of Object.entries(busStudentsMap)) {
-    busCountMap[busId] = set.size;
-  }
+  const mergeSets = (mapA, mapB) =>
+    Object.fromEntries(
+      [...new Set([...Object.keys(mapA), ...Object.keys(mapB)])].map((k) => [
+        k,
+        new Set([...(mapA[k] || []), ...(mapB[k] || [])]),
+      ])
+    );
 
-  const routeCountMap = {};
-  for (const [routeId, set] of Object.entries(routeStudentsMap)) {
-    routeCountMap[routeId] = set.size;
-  }
-
-  return { busCountMap, routeCountMap };
+  return {
+    busStudentCountMap:   toCountMap(busStudentMap),
+    busEmployeeCountMap:  toCountMap(busEmployeeMap),
+    routeStudentCountMap: toCountMap(routeStudentMap),
+    routeEmployeeCountMap: toCountMap(routeEmployeeMap),
+    // Combined maps for backward-compat (getTransportRouteDetail)
+    busCountMap:   toCountMap(mergeSets(busStudentMap, busEmployeeMap)),
+    routeCountMap: toCountMap(mergeSets(routeStudentMap, routeEmployeeMap)),
+  };
 };
 
 /** GET /api/transport/routes — list bus routes from the transport database. */
@@ -162,7 +161,14 @@ export const listTransportRoutes = async (_req, res) => {
       .toArray();
 
     const busNumbers = buses.map((b) => b.busNumber).filter(Boolean);
-    const { busCountMap, routeCountMap } = await getBusOccupancyMap(db, busNumbers, routeIds);
+    const {
+      busStudentCountMap,
+      busEmployeeCountMap,
+      routeStudentCountMap,
+      routeEmployeeCountMap,
+      busCountMap,
+      routeCountMap,
+    } = await getBusOccupancyMap(db, busNumbers, routeIds);
 
     const busesByRoute = {};
     for (const b of buses) {
@@ -174,25 +180,31 @@ export const listTransportRoutes = async (_req, res) => {
     const formattedRoutes = routes.map((r) => {
       const summary = formatRouteSummary(r);
       const assignedBuses = busesByRoute[r.routeId] || [];
+      const assignedBusNumbers = assignedBuses.map((b) => b.busNumber).filter(Boolean);
       let totalCapacity = 0;
-      let totalFilled = 0;
+      let studentFilled = 0;
+      let employeeFilled = 0;
       if (assignedBuses.length > 0) {
         for (const b of assignedBuses) {
           const cap = Number(b.capacity) || 40;
-          const filled = busCountMap[b.busNumber] || 0;
           totalCapacity += cap;
-          totalFilled += filled;
         }
       } else {
         totalCapacity = 40;
-        totalFilled = routeCountMap[r.routeId] || 0;
       }
+      studentFilled = routeStudentCountMap[r.routeId] || 0;
+      employeeFilled = routeEmployeeCountMap[r.routeId] || 0;
+
+      const totalFilled = studentFilled + employeeFilled;
       const seatsAvailable = Math.max(0, totalCapacity - totalFilled);
       return {
         ...summary,
         capacity: totalCapacity,
         seatsFilled: totalFilled,
+        studentRequestCount: studentFilled,
+        employeeRequestCount: employeeFilled,
         seatsAvailable,
+        assignedBusNumbers,
       };
     });
 

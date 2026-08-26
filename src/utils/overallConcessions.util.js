@@ -33,12 +33,19 @@ const normalizeFeeHeadCode = (raw) => {
 };
 
 const lineMatchesBuilderHead = (line, head) => {
-  const headId = String(head?.id || head?.feeHeadId || '').trim();
   const headCode = normalizeFeeHeadCode(head?.code || head?.feeHeadCode);
-  const lineId = String(line?.feeHeadId || '').trim();
-  const lineCode = normalizeFeeHeadCode(line?.feeHeadCode);
-  if (headId && lineId && headId === lineId) return true;
-  if (headCode && lineCode && headCode === lineCode) return true;
+  const lineCode = normalizeFeeHeadCode(line?.feeHeadCode || line?.code);
+
+  if (headCode && lineCode) {
+    return headCode === lineCode;
+  }
+
+  const headId = String(head?.id || head?.feeHeadId || head?.feeHead || '').trim();
+  const lineId = String(line?.feeHeadId || line?.feeHead || '').trim();
+
+  if (headId && lineId) {
+    return headId === lineId;
+  }
   return false;
 };
 
@@ -344,5 +351,67 @@ export async function buildHasStepFourRevisedFeeEntriesByAdmissionRows(pool, row
   }
 
   return result;
+}
+
+export function resolveFeeHead(entry, feeHeads) {
+  if (!entry || !Array.isArray(feeHeads)) return null;
+  const code = String(entry.feeHeadCode || '').trim().toUpperCase();
+  if (code) {
+    const byCode = feeHeads.find(h => String(h.code || '').trim().toUpperCase() === code);
+    if (byCode) return byCode;
+  }
+  const idStr = String(entry.feeHeadId || entry.feeHead || '').trim();
+  if (idStr) {
+    const byId = feeHeads.find(h => String(h._id || h.id || '') === idStr);
+    if (byId) return byId;
+  }
+  return null;
+}
+
+export function normalizeFeeHeadInEntries(entries, feeHeads) {
+  if (!Array.isArray(entries) || !Array.isArray(feeHeads) || feeHeads.length === 0) {
+    return entries;
+  }
+  return entries.map(entry => {
+    if (!entry) return entry;
+    const matched = resolveFeeHead(entry, feeHeads);
+    if (matched) {
+      const updated = { ...entry };
+      const matchedId = String(matched._id || matched.id);
+      const matchedCode = matched.code || '';
+      const matchedName = matched.name || matched.feeHeadName || matched.headName || '';
+
+      if (updated.feeHeadId !== undefined || updated.feeHead !== undefined) {
+        if (updated.feeHeadId !== undefined) updated.feeHeadId = matchedId;
+        if (updated.feeHead !== undefined) updated.feeHead = matchedId;
+      } else {
+        updated.feeHeadId = matchedId;
+      }
+
+      if (updated.feeHeadCode !== undefined) {
+        updated.feeHeadCode = matchedCode;
+      }
+      if (updated.feeHeadName !== undefined) {
+        updated.feeHeadName = matchedName;
+      }
+      return updated;
+    }
+    return entry;
+  });
+}
+
+export async function normalizeStudentFeeDetails(studentFeeDetails) {
+  if (!studentFeeDetails || !Array.isArray(studentFeeDetails.lines) || studentFeeDetails.lines.length === 0) {
+    return studentFeeDetails;
+  }
+  try {
+    const { connectFeeManagement } = await import('../config-mongo/feeManagement.js');
+    const conn = await connectFeeManagement();
+    const feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+    studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
+  } catch (err) {
+    console.warn('[normalizeStudentFeeDetails] Failed to normalize:', err.message);
+  }
+  return studentFeeDetails;
 }
 

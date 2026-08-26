@@ -1028,6 +1028,18 @@ const formatJoining = async (joiningData, pool, options = {}) => {
     }
   }
 
+  if (studentFeeDetails && Array.isArray(studentFeeDetails.lines) && studentFeeDetails.lines.length > 0) {
+    try {
+      const { connectFeeManagement } = await import('../config-mongo/feeManagement.js');
+      const conn = await connectFeeManagement();
+      const feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+      const { normalizeFeeHeadInEntries } = await import('../utils/overallConcessions.util.js');
+      studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
+    } catch (e) {
+      console.warn('[formatJoining] Failed to normalize fee heads in studentFeeDetails:', e.message);
+    }
+  }
+
   return {
     _id: joiningData.id,
     id: joiningData.id,
@@ -1068,6 +1080,7 @@ const formatJoining = async (joiningData, pool, options = {}) => {
       notes: joiningData.student_notes || '',
       aadhaarNumber: joiningData.student_aadhaar_number || '',
       photo: studentPortrait,
+      isScholarApplicable: joiningData.is_scholar_applicable ? true : false,
     },
     parents: {
       father: {
@@ -1258,6 +1271,7 @@ const formatJoiningListItem = (joiningData) => {
     studentInfo: {
       name: joiningData.student_name || '',
       phone: joiningData.student_phone || '',
+      isScholarApplicable: joiningData.is_scholar_applicable ? true : false,
     },
     paymentSummary: {
       totalFee: Number(joiningData.payment_total_fee) || 0,
@@ -2002,6 +2016,9 @@ const normalizeJoiningPayload = (payload) => {
   if (safePayload.studentInfo) {
     safePayload.studentInfo.name = sanitizeString(safePayload.studentInfo.name);
     safePayload.studentInfo.phone = sanitizeString(safePayload.studentInfo.phone);
+    if (safePayload.studentInfo.isScholarApplicable !== undefined) {
+      safePayload.studentInfo.isScholarApplicable = Boolean(safePayload.studentInfo.isScholarApplicable);
+    }
     const preferredFromPayload = normalizeMobileDigits(
       safePayload.studentInfo.preferredMobileNumber
     );

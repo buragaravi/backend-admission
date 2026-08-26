@@ -17,6 +17,9 @@ import {
   buildOverallConcessionLinesFromPortalLines,
   getMissingBuilderHeadYearAmounts,
   isPersistableBuilderConcessionLine,
+  normalizeStudentFeeDetails,
+  resolveFeeHead,
+  normalizeFeeHeadInEntries,
 } from '../utils/overallConcessions.util.js';
 import { connectFeeManagement } from '../config-mongo/feeManagement.js';
 
@@ -414,6 +417,21 @@ const formatFeeRequestRow = (row) => ({
   updatedAt: row.updated_at,
 });
 
+const formatFeeRequestRowWithHeads = (row, feeHeads = []) => {
+  const formatted = formatFeeRequestRow(row);
+  if (!Array.isArray(feeHeads) || feeHeads.length === 0) return formatted;
+
+  if (Array.isArray(formatted.requestLines)) {
+    formatted.requestLines = normalizeFeeHeadInEntries(formatted.requestLines, feeHeads);
+  }
+
+  if (formatted.studentFeeDetails && Array.isArray(formatted.studentFeeDetails.lines)) {
+    formatted.studentFeeDetails.lines = normalizeFeeHeadInEntries(formatted.studentFeeDetails.lines, feeHeads);
+  }
+
+  return formatted;
+};
+
 /** GET /api/fee-requests?status=pending_approval|approved&page=&limit=&search= */
 export const listFeeRequests = async (req, res) => {
   try {
@@ -458,8 +476,16 @@ export const listFeeRequests = async (req, res) => {
       params
     );
 
+    let feeHeads = [];
+    try {
+      const conn = await connectFeeManagement();
+      feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+    } catch (fhErr) {
+      console.warn('Failed to load feeheads for listFeeRequests:', fhErr.message);
+    }
+
     return successResponse(res, {
-      feeRequests: rows.map(formatFeeRequestRow),
+      feeRequests: rows.map((r) => formatFeeRequestRowWithHeads(r, feeHeads)),
       pagination: {
         page,
         limit,
@@ -487,6 +513,19 @@ export const submitFeeRequest = async (req, res) => {
     }
 
     const studentFeeDetails = sanitizeStudentFeeDetailsForDb(body.studentFeeDetails);
+
+    let feeHeads = [];
+    try {
+      const conn = await connectFeeManagement();
+      feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+    } catch (fhErr) {
+      console.warn('Failed to load feeheads for submitFeeRequest normalization:', fhErr.message);
+    }
+
+    if (studentFeeDetails && Array.isArray(studentFeeDetails.lines)) {
+      studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
+    }
+
     const registrationExtras =
       body.registrationFormData && typeof body.registrationFormData === 'object'
         ? body.registrationFormData
@@ -741,7 +780,7 @@ export const submitFeeRequest = async (req, res) => {
         requestedByName: String(req.user?.name || ''),
       });
 
-      return successResponse(res, formatFeeRequestRow(updated[0]), 'Fee request updated', 200);
+      return successResponse(res, formatFeeRequestRowWithHeads(updated[0], feeHeads), 'Fee request updated', 200);
     }
 
     const id = uuidv4();
@@ -785,7 +824,7 @@ export const submitFeeRequest = async (req, res) => {
       requestedByName: String(req.user?.name || ''),
     });
 
-    return successResponse(res, formatFeeRequestRow(created[0]), 'Fee request submitted', 201);
+    return successResponse(res, formatFeeRequestRowWithHeads(created[0], feeHeads), 'Fee request submitted', 201);
   } catch (error) {
     console.error('submitFeeRequest error:', error);
     return errorResponse(res, error.message || 'Failed to submit fee request', 500);
@@ -919,6 +958,18 @@ export const approveFeeRequest = async (req, res) => {
       }
       studentFeeDetails = sanitizeStudentFeeDetailsForDb(studentFeeDetails);
 
+      let feeHeads = [];
+      try {
+        const conn = await connectFeeManagement();
+        feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+      } catch (fhErr) {
+        console.warn('Failed to load feeheads for approveFeeRequest:', fhErr.message);
+      }
+
+      if (studentFeeDetails && Array.isArray(studentFeeDetails.lines)) {
+        studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
+      }
+
       const revisedFeesFromBuilder = buildOverallConcessionLinesFromBuilder(
         studentFeeDetails || { lines: [] }
       );
@@ -926,6 +977,8 @@ export const approveFeeRequest = async (req, res) => {
         revisedFeesFromBuilder.length > 0
           ? revisedFeesFromBuilder
           : buildOverallConcessionLinesFromPortalLines(requestLines);
+
+      const revisedFeesNormalized = normalizeFeeHeadInEntries(revisedFees, feeHeads);
 
       await secondaryPool.execute(
         `INSERT INTO overall_concessions 
@@ -947,7 +1000,7 @@ export const approveFeeRequest = async (req, res) => {
           batch,
           course,
           branch,
-          JSON.stringify(revisedFees)
+          JSON.stringify(revisedFeesNormalized)
         ]
       );
       console.log(`Synced concessions for ${request.admission_number} to secondary overall_concessions`);
@@ -955,8 +1008,16 @@ export const approveFeeRequest = async (req, res) => {
       console.error('Failed to sync concessions to secondary database overall_concessions:', secErr);
     }
 
+    let responseFeeHeads = [];
+    try {
+      const conn = await connectFeeManagement();
+      responseFeeHeads = await conn.db.collection('feeheads').find({}).toArray();
+    } catch (fhErr) {
+      console.warn('Failed to load feeheads for approveFeeRequest response:', fhErr.message);
+    }
+
     const [updated] = await pool.execute('SELECT * FROM fee_requests WHERE id = ?', [id]);
-    return successResponse(res, formatFeeRequestRow(updated[0]), 'Fee request approved', 200);
+    return successResponse(res, formatFeeRequestRowWithHeads(updated[0], responseFeeHeads), 'Fee request approved', 200);
   } catch (error) {
     console.error('approveFeeRequest error:', error);
     return errorResponse(res, error.message || 'Failed to approve fee request', 500);
@@ -1009,8 +1070,15 @@ export const rejectFeeRequest = async (req, res) => {
       console.error('[FeeRequestMongo] Failed to update status to REJECTED in Mongo:', mongoErr?.message || mongoErr);
     }
 
+    let feeHeads = [];
+    try {
+      const conn = await connectFeeManagement();
+      feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+    } catch (fhErr) {
+      console.warn('Failed to load feeheads for rejectFeeRequest:', fhErr.message);
+    }
     const [updated] = await pool.execute('SELECT * FROM fee_requests WHERE id = ?', [id]);
-    return successResponse(res, formatFeeRequestRow(updated[0]), 'Fee request rejected', 200);
+    return successResponse(res, formatFeeRequestRowWithHeads(updated[0], feeHeads), 'Fee request rejected', 200);
   } catch (error) {
     console.error('rejectFeeRequest error:', error);
     return errorResponse(res, error.message || 'Failed to reject fee request', 500);
@@ -1031,7 +1099,14 @@ export const getPendingFeeRequestForJoining = async (req, res) => {
       [joiningId]
     );
 
-    return successResponse(res, rows.length ? formatFeeRequestRow(rows[0]) : null);
+    let feeHeads = [];
+    try {
+      const conn = await connectFeeManagement();
+      feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+    } catch (fhErr) {
+      console.warn('Failed to load feeheads for getPendingFeeRequestForJoining:', fhErr.message);
+    }
+    return successResponse(res, rows.length ? formatFeeRequestRowWithHeads(rows[0], feeHeads) : null);
   } catch (error) {
     console.error('getPendingFeeRequestForJoining error:', error);
     return errorResponse(res, error.message || 'Failed to load fee request', 500);

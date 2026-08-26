@@ -1740,6 +1740,21 @@ export const formatAdmission = async (admissionData, pool) => {
       ? { ...leadData, reference1: referenceName }
       : leadData;
 
+  if (leadDataWithReference && leadDataWithReference._joiningStudentFeeDetails && Array.isArray(leadDataWithReference._joiningStudentFeeDetails.lines)) {
+    try {
+      const { connectFeeManagement } = await import('../config-mongo/feeManagement.js');
+      const conn = await connectFeeManagement();
+      const feeHeads = await conn.db.collection('feeheads').find({}).toArray();
+      const { normalizeFeeHeadInEntries } = await import('../utils/overallConcessions.util.js');
+      leadDataWithReference._joiningStudentFeeDetails.lines = normalizeFeeHeadInEntries(
+        leadDataWithReference._joiningStudentFeeDetails.lines,
+        feeHeads
+      );
+    } catch (e) {
+      console.warn('[formatAdmission] Failed to normalize fee heads in _joiningStudentFeeDetails:', e.message);
+    }
+  }
+
   return {
     _id: admissionData.id,
     id: admissionData.id,

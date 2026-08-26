@@ -807,6 +807,7 @@ export const syncToSecondaryDatabase = async (admissionData, admissionNumber, ex
     const hasCollegeIdColumn = studentCols.has('college_id');
     const hasCourseIdColumn = studentCols.has('course_id');
     const hasBranchIdColumn = studentCols.has('branch_id');
+    const hasIsScholarApplicableColumn = studentCols.has('is_scholar_applicable');
 
     const casteWriteColumns = ['caste'];
     const casteWriteValues = [secondaryCaste];
@@ -831,6 +832,10 @@ export const syncToSecondaryDatabase = async (admissionData, admissionNumber, ex
       casteWriteColumns.push('branch_id');
       const mbid = Number.parseInt(String(admissionData?.courseInfo?.branchId ?? registrationExtras?.managed_branch_id ?? registrationExtras?.managedBranchId ?? '').trim(), 10);
       casteWriteValues.push(Number.isFinite(mbid) ? mbid : null);
+    }
+    if (hasIsScholarApplicableColumn) {
+      casteWriteColumns.push('is_scholar_applicable');
+      casteWriteValues.push(admissionData?.studentInfo?.isScholarApplicable ? 1 : 0);
     }
 
     const studentCoreParams = [

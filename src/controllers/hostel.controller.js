@@ -707,8 +707,30 @@ export const getHostelStudentDetails = async (req, res) => {
         hostelName = hostelDoc?.name || '';
       }
 
+      // HMS print (`hostel-admit`) looks up `users._id`, not hostelrequests._id.
+      let studentUserId = '';
+      if (existingRequest.studentMasterId) {
+        const master = await db.collection('studentmasters').findOne({
+          _id: toObjectIdOrString(existingRequest.studentMasterId),
+        });
+        if (master?.userId) studentUserId = String(master.userId);
+      }
+      if (!studentUserId && admNum) {
+        const hostelUser = await db.collection('users').findOne({ admissionNumber: admNum });
+        if (hostelUser?._id) studentUserId = String(hostelUser._id);
+      }
+      if (!studentUserId && joinId) {
+        const hostelUser = await db.collection('users').findOne({
+          joiningId: joinId,
+          source: 'admissions_crm',
+        });
+        if (hostelUser?._id) studentUserId = String(hostelUser._id);
+      }
+
       return successResponse(res, {
         _id: String(existingRequest._id),
+        studentUserId,
+        admissionNumber: existingRequest.admissionNumber || admNum || '',
         hostelId: existingRequest.hostelSequenceId, // Return hostelSequenceId as the display ID
         isAssigned: true,
         bedNumber: existingRequest.bedNumber || '',

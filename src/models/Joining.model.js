@@ -63,6 +63,7 @@ const joiningSchema = new Schema(
       gender: { type: String, trim: true, default: '' },
       dateOfBirth: { type: String, trim: true, default: '' }, // DD-MM-YYYY
       notes: { type: String, trim: true, default: 'As per SSC for no issues' },
+      isScholarApplicable: { type: Boolean, default: false },
     },
     parents: {
       father: {
