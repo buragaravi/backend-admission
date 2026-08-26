@@ -17,6 +17,7 @@ import {
   updateAdmissionByLead,
   patchAdmissionReferenceById,
   patchAdmissionRemarksById,
+  patchAdmissionPhaseById,
   getAdmissionStats,
   getAdmissionStatsByReference,
   getAdmissionStatsByReferenceAdmissions,
@@ -95,6 +96,7 @@ router.post('/id/:admissionId/send-confirmation-sms', sendAdmissionConfirmationS
 router.post('/id/:admissionId/send-document-notification', sendDocumentNotificationSmsById);
 router.patch('/id/:admissionId/reference', requireJoiningEditReference, patchAdmissionReferenceById);
 router.patch('/id/:admissionId/remarks', requireJoiningEditAdmission, patchAdmissionRemarksById);
+router.patch('/id/:admissionId/phase', requireJoiningEditAdmission, patchAdmissionPhaseById);
 router.put('/id/:admissionId', requireJoiningEditAdmission, updateAdmissionById);
 router.put('/:leadId', requireJoiningEditAdmission, updateAdmissionByLead); // Keep for backward compatibility
 

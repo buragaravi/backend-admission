@@ -927,9 +927,28 @@ const readApplicationEditHistory = (leadData) => {
       at: entry.at ? String(entry.at) : null,
       statusFrom: entry.statusFrom != null ? String(entry.statusFrom) : null,
       statusTo: entry.statusTo != null ? String(entry.statusTo) : null,
+      referenceFrom:
+        Object.prototype.hasOwnProperty.call(entry, 'referenceFrom')
+          ? String(entry.referenceFrom ?? '').trim()
+          : null,
+      referenceTo:
+        Object.prototype.hasOwnProperty.call(entry, 'referenceTo')
+          ? String(entry.referenceTo ?? '').trim()
+          : null,
       source: String(entry.source || 'admission').trim() || 'admission',
     }))
     .filter((entry) => entry.at);
+};
+
+const isReferenceHistoryEvent = (event) => {
+  if (!event) return false;
+  const kind = String(event.kind || '').toLowerCase();
+  if (kind === 'reference_change' || kind === 'reference') return true;
+  if (event.referenceFrom != null || event.referenceTo != null) return true;
+  const title = String(event.title || '').toLowerCase();
+  if (title.includes('reference updated') || title.includes('reference changed')) return true;
+  const description = String(event.description || '').toLowerCase();
+  return description.includes('admission reference changed');
 };
 
 /** Append an application edit event onto admissions.lead_data (and activity_logs when lead exists). */
@@ -945,6 +964,8 @@ const appendAdmissionApplicationEditHistory = async (
     kind = 'update',
     statusFrom = null,
     statusTo = null,
+    referenceFrom = null,
+    referenceTo = null,
   }
 ) => {
   if (!admissionId || !userId) return;
@@ -962,6 +983,15 @@ const appendAdmissionApplicationEditHistory = async (
       resolvedName = String(users?.[0]?.name || '').trim();
     }
 
+    const normalizedReferenceFrom =
+      referenceFrom === undefined || referenceFrom === null
+        ? null
+        : String(referenceFrom).trim();
+    const normalizedReferenceTo =
+      referenceTo === undefined || referenceTo === null
+        ? null
+        : String(referenceTo).trim();
+
     const entry = {
       id: uuidv4(),
       kind,
@@ -972,6 +1002,12 @@ const appendAdmissionApplicationEditHistory = async (
       at: new Date().toISOString(),
       statusFrom: statusFrom || null,
       statusTo: statusTo || null,
+      ...(normalizedReferenceFrom !== null || normalizedReferenceTo !== null || kind === 'reference_change'
+        ? {
+            referenceFrom: normalizedReferenceFrom ?? '',
+            referenceTo: normalizedReferenceTo ?? '',
+          }
+        : {}),
       source: 'admission',
     };
 
@@ -1004,6 +1040,8 @@ const appendAdmissionApplicationEditHistory = async (
               description: entry.description || null,
               statusFrom: entry.statusFrom,
               statusTo: entry.statusTo,
+              referenceFrom: entry.referenceFrom,
+              referenceTo: entry.referenceTo,
               source: 'admission_application_history',
             }),
           ]
@@ -1047,6 +1085,16 @@ const pushTimelineEvent = (events, event) => {
     at: event.at,
     statusFrom: event.statusFrom || null,
     statusTo: event.statusTo || null,
+    referenceFrom: Object.prototype.hasOwnProperty.call(event, 'referenceFrom')
+      ? String(event.referenceFrom ?? '').trim()
+      : event.referenceFrom != null && String(event.referenceFrom).trim() !== ''
+        ? String(event.referenceFrom).trim()
+        : null,
+    referenceTo: Object.prototype.hasOwnProperty.call(event, 'referenceTo')
+      ? String(event.referenceTo ?? '').trim()
+      : event.referenceTo != null && String(event.referenceTo).trim() !== ''
+        ? String(event.referenceTo).trim()
+        : null,
     source: String(event.source || 'system'),
   });
 };
@@ -1054,11 +1102,14 @@ const pushTimelineEvent = (events, event) => {
 /**
  * Timeline of application changes from initial entry through latest updates.
  * Combines joining milestones, admission milestones, stored edit history, and joining_update activity logs.
+ * Optional query: ?scope=reference — only reference change events.
  */
 export const getAdmissionApplicationHistory = async (req, res) => {
   try {
     const { admissionId } = req.params;
     ensureAdmissionId(admissionId);
+    const scope = String(req.query?.scope || '').trim().toLowerCase();
+    const referenceOnly = scope === 'reference' || scope === 'references';
 
     const pool = getPool();
     const [admissions] = await pool.execute(
@@ -1116,73 +1167,76 @@ export const getAdmissionApplicationHistory = async (req, res) => {
     const nameById = await resolveUserNamesByIds(pool, actorIds);
     const events = [];
 
-    if (joining?.created_at) {
-      pushTimelineEvent(events, {
-        id: `joining-created-${joining.id}`,
-        kind: 'initial',
-        title: 'Initial application entry',
-        description: 'Joining application first created',
-        performedById: joining.created_by || null,
-        performedByName:
-          nameById[String(joining.created_by || '')] ||
-          normalizeHistoryActorName('', joining.created_by),
-        at: joining.created_at,
-        source: 'joining',
-      });
-    }
-
-    if (joining?.submitted_at) {
-      pushTimelineEvent(events, {
-        id: `joining-submitted-${joining.id}`,
-        kind: 'submitted',
-        title: 'Application submitted for approval',
-        performedById: joining.submitted_by || null,
-        performedByName:
-          nameById[String(joining.submitted_by || '')] ||
-          normalizeHistoryActorName('', joining.submitted_by),
-        at: joining.submitted_at,
-        statusTo: 'pending_approval',
-        source: 'joining',
-      });
-    }
-
-    if (joining?.approved_at) {
-      pushTimelineEvent(events, {
-        id: `joining-approved-${joining.id}`,
-        kind: 'approved',
-        title: 'Application approved',
-        description: 'Joining approved and admission created',
-        performedById: joining.approved_by || null,
-        performedByName:
-          nameById[String(joining.approved_by || '')] ||
-          normalizeHistoryActorName('', joining.approved_by),
-        at: joining.approved_at,
-        statusTo: 'approved',
-        source: 'joining',
-      });
-    }
-
-    if (admission.created_at) {
-      const alreadyHaveJoiningCreated =
-        joining?.created_at &&
-        Math.abs(new Date(admission.created_at).getTime() - new Date(joining.created_at).getTime()) <
-          2000;
-      if (!alreadyHaveJoiningCreated || !joining?.created_at) {
+    if (!referenceOnly) {
+      if (joining?.created_at) {
         pushTimelineEvent(events, {
-          id: `admission-created-${admission.id}`,
-          kind: joining?.created_at ? 'approved' : 'initial',
-          title: joining?.created_at ? 'Admission record created' : 'Initial admission entry',
-          performedById: admission.created_by || null,
+          id: `joining-created-${joining.id}`,
+          kind: 'initial',
+          title: 'Initial application entry',
+          description: 'Joining application first created',
+          performedById: joining.created_by || null,
           performedByName:
-            nameById[String(admission.created_by || '')] ||
-            normalizeHistoryActorName('', admission.created_by),
-          at: admission.created_at,
-          source: 'admission',
+            nameById[String(joining.created_by || '')] ||
+            normalizeHistoryActorName('', joining.created_by),
+          at: joining.created_at,
+          source: 'joining',
         });
+      }
+
+      if (joining?.submitted_at) {
+        pushTimelineEvent(events, {
+          id: `joining-submitted-${joining.id}`,
+          kind: 'submitted',
+          title: 'Application submitted for approval',
+          performedById: joining.submitted_by || null,
+          performedByName:
+            nameById[String(joining.submitted_by || '')] ||
+            normalizeHistoryActorName('', joining.submitted_by),
+          at: joining.submitted_at,
+          statusTo: 'pending_approval',
+          source: 'joining',
+        });
+      }
+
+      if (joining?.approved_at) {
+        pushTimelineEvent(events, {
+          id: `joining-approved-${joining.id}`,
+          kind: 'approved',
+          title: 'Application approved',
+          description: 'Joining approved and admission created',
+          performedById: joining.approved_by || null,
+          performedByName:
+            nameById[String(joining.approved_by || '')] ||
+            normalizeHistoryActorName('', joining.approved_by),
+          at: joining.approved_at,
+          statusTo: 'approved',
+          source: 'joining',
+        });
+      }
+
+      if (admission.created_at) {
+        const alreadyHaveJoiningCreated =
+          joining?.created_at &&
+          Math.abs(new Date(admission.created_at).getTime() - new Date(joining.created_at).getTime()) <
+            2000;
+        if (!alreadyHaveJoiningCreated || !joining?.created_at) {
+          pushTimelineEvent(events, {
+            id: `admission-created-${admission.id}`,
+            kind: joining?.created_at ? 'approved' : 'initial',
+            title: joining?.created_at ? 'Admission record created' : 'Initial admission entry',
+            performedById: admission.created_by || null,
+            performedByName:
+              nameById[String(admission.created_by || '')] ||
+              normalizeHistoryActorName('', admission.created_by),
+            at: admission.created_at,
+            source: 'admission',
+          });
+        }
       }
     }
 
     for (const entry of storedHistory) {
+      if (referenceOnly && !isReferenceHistoryEvent(entry)) continue;
       pushTimelineEvent(events, {
         ...entry,
         performedByName:
@@ -1205,7 +1259,7 @@ export const getAdmissionApplicationHistory = async (req, res) => {
       // Skip duplicates already recorded into admission edit history.
       if (metadata?.source === 'admission_application_history') continue;
 
-      pushTimelineEvent(events, {
+      const activityEvent = {
         id: `activity-${log.id}`,
         kind: log.type === 'status_change' ? 'status_change' : 'update',
         title: String(log.comment || 'Application updated').trim() || 'Application updated',
@@ -1224,49 +1278,55 @@ export const getAdmissionApplicationHistory = async (req, res) => {
         at: log.created_at,
         statusFrom: metadata.statusFrom || log.old_status || null,
         statusTo: metadata.statusTo || log.new_status || null,
+        referenceFrom: metadata.referenceFrom || null,
+        referenceTo: metadata.referenceTo || null,
         source: 'activity_log',
-      });
+      };
+      if (referenceOnly && !isReferenceHistoryEvent(activityEvent)) continue;
+      pushTimelineEvent(events, activityEvent);
     }
 
-    const cancellation = leadData?._admissionCancellation;
-    if (cancellation?.cancelledAt) {
-      pushTimelineEvent(events, {
-        id: `admission-cancelled-${admission.id}`,
-        kind: 'cancelled',
-        title: 'Admission cancelled',
-        description: String(cancellation.reason || '').trim(),
-        performedById: cancellation.cancelledBy || null,
-        performedByName:
-          String(cancellation.approvedBy || '').trim() ||
-          nameById[String(cancellation.cancelledBy || '')] ||
-          '—',
-        at: cancellation.cancelledAt,
-        statusTo: ADMISSION_CANCELLED_STATUS,
-        source: 'admission',
-      });
-    }
-
-    if (
-      admission.updated_at &&
-      admission.created_at &&
-      new Date(admission.updated_at).getTime() - new Date(admission.created_at).getTime() > 2000
-    ) {
-      const updatedMs = new Date(admission.updated_at).getTime();
-      const hasNearbyEvent = events.some(
-        (event) => Math.abs(new Date(event.at).getTime() - updatedMs) < 5000
-      );
-      if (!hasNearbyEvent) {
+    if (!referenceOnly) {
+      const cancellation = leadData?._admissionCancellation;
+      if (cancellation?.cancelledAt) {
         pushTimelineEvent(events, {
-          id: `admission-updated-${admission.id}-${updatedMs}`,
-          kind: 'update',
-          title: 'Last admission update',
-          performedById: admission.updated_by || null,
+          id: `admission-cancelled-${admission.id}`,
+          kind: 'cancelled',
+          title: 'Admission cancelled',
+          description: String(cancellation.reason || '').trim(),
+          performedById: cancellation.cancelledBy || null,
           performedByName:
-            nameById[String(admission.updated_by || '')] ||
-            normalizeHistoryActorName('', admission.updated_by),
-          at: admission.updated_at,
+            String(cancellation.approvedBy || '').trim() ||
+            nameById[String(cancellation.cancelledBy || '')] ||
+            '—',
+          at: cancellation.cancelledAt,
+          statusTo: ADMISSION_CANCELLED_STATUS,
           source: 'admission',
         });
+      }
+
+      if (
+        admission.updated_at &&
+        admission.created_at &&
+        new Date(admission.updated_at).getTime() - new Date(admission.created_at).getTime() > 2000
+      ) {
+        const updatedMs = new Date(admission.updated_at).getTime();
+        const hasNearbyEvent = events.some(
+          (event) => Math.abs(new Date(event.at).getTime() - updatedMs) < 5000
+        );
+        if (!hasNearbyEvent) {
+          pushTimelineEvent(events, {
+            id: `admission-updated-${admission.id}-${updatedMs}`,
+            kind: 'update',
+            title: 'Last admission update',
+            performedById: admission.updated_by || null,
+            performedByName:
+              nameById[String(admission.updated_by || '')] ||
+              normalizeHistoryActorName('', admission.updated_by),
+            at: admission.updated_at,
+            source: 'admission',
+          });
+        }
       }
     }
 
@@ -1293,9 +1353,12 @@ export const getAdmissionApplicationHistory = async (req, res) => {
         admissionId: admission.id,
         joiningId: admission.joining_id || null,
         leadId: admission.lead_id || null,
+        scope: referenceOnly ? 'reference' : 'all',
         events: deduped,
       },
-      'Admission application history retrieved successfully',
+      referenceOnly
+        ? 'Admission reference history retrieved successfully'
+        : 'Admission application history retrieved successfully',
       200
     );
   } catch (error) {
@@ -1311,11 +1374,12 @@ export const getAdmissionApplicationHistory = async (req, res) => {
 /**
  * Persist Excel "Reference 1" on admission + linked joining + CRM lead (same as import script).
  * Stored at lead_data.reference1 (admissions/joinings) and dynamic_fields.reference1 (leads).
+ * @returns {{ previous: string, next: string, changed: boolean, admissionId: string, leadId: string|null, joiningId: string|null }}
  */
 export const persistAdmissionReference1 = async (pool, admissionId, reference1, userId) => {
   const ref = String(reference1 ?? '').trim();
   const [admRows] = await pool.execute(
-    'SELECT id, lead_id, joining_id FROM admissions WHERE id = ? LIMIT 1',
+    'SELECT id, lead_id, joining_id, lead_data FROM admissions WHERE id = ? LIMIT 1',
     [admissionId]
   );
   if (!admRows.length) {
@@ -1324,6 +1388,8 @@ export const persistAdmissionReference1 = async (pool, admissionId, reference1, 
     throw err;
   }
   const row = admRows[0];
+  const previousLeadData = parseAdmissionLeadData(row.lead_data);
+  const previous = String(previousLeadData.reference1 ?? previousLeadData.referenceName ?? '').trim();
 
   await pool.execute(
     `UPDATE admissions SET
@@ -1363,6 +1429,43 @@ export const persistAdmissionReference1 = async (pool, admissionId, reference1, 
       [ref, row.lead_id]
     );
   }
+
+  return {
+    previous,
+    next: ref,
+    changed: previous !== ref,
+    admissionId,
+    leadId: row.lead_id || null,
+    joiningId: row.joining_id || null,
+  };
+};
+
+/**
+ * Persist reference1 and append reference-change history when the value actually changes.
+ */
+export const persistAdmissionReference1WithHistory = async (
+  pool,
+  admissionId,
+  reference1,
+  user,
+) => {
+  const userId = user?.id;
+  if (!admissionId || !userId) {
+    return persistAdmissionReference1(pool, admissionId, reference1, userId);
+  }
+  const result = await persistAdmissionReference1(pool, admissionId, reference1, userId);
+  if (result.changed) {
+    await appendAdmissionApplicationEditHistory(pool, {
+      admissionId,
+      leadId: result.leadId,
+      userId,
+      userName: user?.name,
+      kind: 'reference_change',
+      title: 'Reference updated',
+      description: 'Admission reference changed',
+    });
+  }
+  return result;
 };
 
 export const persistAdmissionRemarks = async (pool, admissionId, remarks, userId) => {
@@ -1384,6 +1487,67 @@ export const persistAdmissionRemarks = async (pool, admissionId, remarks, userId
      WHERE id = ?`,
     [String(remarks ?? ''), userId || null, admissionId]
   );
+};
+
+/**
+ * Normalize admission phase to "1"…"5", or empty string when unset/invalid.
+ */
+export const normalizeAdmissionPhase = (value) => {
+  if (value === undefined || value === null) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
+  const match = raw.match(/^phase\s*([1-5])$/i) || raw.match(/^([1-5])$/);
+  return match ? match[1] : '';
+};
+
+/**
+ * Persist admission phase on admissions (+ linked joining) lead_data.admissionPhase.
+ * @returns {{ previous: string, next: string, changed: boolean }}
+ */
+export const persistAdmissionPhase = async (pool, admissionId, admissionPhase, userId) => {
+  const next = normalizeAdmissionPhase(admissionPhase);
+  const [admRows] = await pool.execute(
+    'SELECT id, joining_id, lead_data FROM admissions WHERE id = ? LIMIT 1',
+    [admissionId]
+  );
+  if (!admRows.length) {
+    const err = new Error('Admission record not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  const row = admRows[0];
+  const previousLeadData = parseAdmissionLeadData(row.lead_data);
+  const previous = normalizeAdmissionPhase(
+    previousLeadData.admissionPhase ?? previousLeadData.admission_phase
+  );
+
+  await pool.execute(
+    `UPDATE admissions SET
+       lead_data = JSON_SET(
+         COALESCE(CASE WHEN JSON_VALID(lead_data) THEN lead_data ELSE JSON_OBJECT() END, JSON_OBJECT()),
+         '$.admissionPhase', ?
+       ),
+       updated_by = ?,
+       updated_at = NOW()
+     WHERE id = ?`,
+    [next, userId || null, admissionId]
+  );
+
+  if (row.joining_id) {
+    await pool.execute(
+      `UPDATE joinings SET
+         lead_data = JSON_SET(
+           COALESCE(CASE WHEN JSON_VALID(lead_data) THEN lead_data ELSE JSON_OBJECT() END, JSON_OBJECT()),
+           '$.admissionPhase', ?
+         ),
+         updated_by = ?,
+         updated_at = NOW()
+       WHERE id = ?`,
+      [next, userId || null, row.joining_id]
+    );
+  }
+
+  return { previous, next, changed: previous !== next };
 };
 
 /**
@@ -1882,6 +2046,9 @@ export const formatAdmission = async (admissionData, pool) => {
     createdAt: admissionData.created_at,
     updatedAt: admissionData.updated_at,
     remarks: admissionData.remarks || '',
+    admissionPhase: normalizeAdmissionPhase(
+      leadDataRaw?.admissionPhase ?? leadDataRaw?.admission_phase
+    ),
   };
 };
 
@@ -3878,7 +4045,22 @@ export const updateAdmissionById = async (req, res) => {
     }
 
     if (payload.reference1 !== undefined) {
-      await persistAdmissionReference1(pool, admissionId, payload.reference1, req.user.id);
+      await persistAdmissionReference1WithHistory(
+        pool,
+        admissionId,
+        payload.reference1,
+        req.user
+      );
+    }
+
+    if (payload.admissionPhase !== undefined || payload.phase !== undefined) {
+      const rawPhase =
+        payload.admissionPhase !== undefined ? payload.admissionPhase : payload.phase;
+      const normalized = normalizeAdmissionPhase(rawPhase);
+      if (String(rawPhase ?? '').trim() !== '' && !normalized) {
+        return errorResponse(res, 'admissionPhase must be 1, 2, 3, 4, or 5', 400);
+      }
+      await persistAdmissionPhase(pool, admissionId, normalized, req.user.id);
     }
 
     if (payload.registrationFormData !== undefined || Object.prototype.hasOwnProperty.call(payload, 'studentFeeDetails')) {
@@ -4187,7 +4369,22 @@ export const updateAdmissionByLead = async (req, res) => {
     }
 
     if (payload.reference1 !== undefined) {
-      await persistAdmissionReference1(pool, admissionId, payload.reference1, req.user.id);
+      await persistAdmissionReference1WithHistory(
+        pool,
+        admissionId,
+        payload.reference1,
+        req.user
+      );
+    }
+
+    if (payload.admissionPhase !== undefined || payload.phase !== undefined) {
+      const rawPhase =
+        payload.admissionPhase !== undefined ? payload.admissionPhase : payload.phase;
+      const normalized = normalizeAdmissionPhase(rawPhase);
+      if (String(rawPhase ?? '').trim() !== '' && !normalized) {
+        return errorResponse(res, 'admissionPhase must be 1, 2, 3, 4, or 5', 400);
+      }
+      await persistAdmissionPhase(pool, admissionId, normalized, req.user.id);
     }
 
     if (payload.registrationFormData !== undefined || Object.prototype.hasOwnProperty.call(payload, 'studentFeeDetails')) {
@@ -4251,20 +4448,15 @@ export const patchAdmissionReferenceById = async (req, res) => {
     }
 
     const pool = getPool();
-    await persistAdmissionReference1(pool, admissionId, req.body.reference1, req.user.id);
+    await persistAdmissionReference1WithHistory(
+      pool,
+      admissionId,
+      req.body.reference1,
+      req.user
+    );
 
     const [updated] = await pool.execute('SELECT * FROM admissions WHERE id = ?', [admissionId]);
     const formattedAdmission = await formatAdmission(updated[0], pool);
-
-    await appendAdmissionApplicationEditHistory(pool, {
-      admissionId,
-      leadId: formattedAdmission.leadId,
-      userId: req.user.id,
-      userName: req.user.name,
-      kind: 'update',
-      title: 'Reference updated',
-      description: 'Admission reference changed',
-    });
 
     return successResponse(res, formattedAdmission, 'Reference updated successfully', 200);
   } catch (error) {
@@ -4319,6 +4511,62 @@ export const patchAdmissionRemarksById = async (req, res) => {
     return errorResponse(
       res,
       error.message || 'Failed to update admission remarks',
+      error.statusCode || 500
+    );
+  }
+};
+
+/**
+ * @desc    Update admission phase only (lead_data.admissionPhase = 1…5)
+ * @route   PATCH /api/admissions/id/:admissionId/phase
+ */
+export const patchAdmissionPhaseById = async (req, res) => {
+  try {
+    const { admissionId } = req.params;
+    ensureAdmissionId(admissionId);
+
+    if (req.body?.admissionPhase === undefined && req.body?.phase === undefined) {
+      return errorResponse(res, 'admissionPhase is required', 400);
+    }
+
+    const rawPhase = req.body?.admissionPhase !== undefined ? req.body.admissionPhase : req.body.phase;
+    const normalized = normalizeAdmissionPhase(rawPhase);
+    // Allow clearing (empty) or Phase 1–5 only.
+    if (String(rawPhase ?? '').trim() !== '' && !normalized) {
+      return errorResponse(res, 'admissionPhase must be 1, 2, 3, 4, or 5', 400);
+    }
+
+    const pool = getPool();
+    const result = await persistAdmissionPhase(
+      pool,
+      admissionId,
+      normalized,
+      req.user?.id
+    );
+
+    const [updated] = await pool.execute('SELECT * FROM admissions WHERE id = ?', [admissionId]);
+    const formattedAdmission = await formatAdmission(updated[0], pool);
+
+    if (result.changed) {
+      const fromLabel = result.previous ? `Phase ${result.previous}` : '(empty)';
+      const toLabel = result.next ? `Phase ${result.next}` : '(empty)';
+      await appendAdmissionApplicationEditHistory(pool, {
+        admissionId,
+        leadId: formattedAdmission.leadId,
+        userId: req.user.id,
+        userName: req.user.name,
+        kind: 'update',
+        title: 'Admission phase updated',
+        description: `${fromLabel} → ${toLabel}`,
+      });
+    }
+
+    return successResponse(res, formattedAdmission, 'Admission phase updated successfully', 200);
+  } catch (error) {
+    console.error('Error updating admission phase:', error);
+    return errorResponse(
+      res,
+      error.message || 'Failed to update admission phase',
       error.statusCode || 500
     );
   }

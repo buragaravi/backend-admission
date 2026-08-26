@@ -9,7 +9,8 @@ import { syncJoiningStudentFeeDetailsToFeeMongo } from '../services/joiningStude
 import { normalizeCalendarAcademicYear } from '../utils/transportApplicationNumber.util.js';
 import {
   formatAdmission,
-  persistAdmissionReference1,
+  persistAdmissionReference1WithHistory,
+  persistAdmissionPhase,
   persistAdmissionCourseBranchUpdate,
 } from './admission.controller.js';
 import { resolveBtechCourseDisplayName, deriveAdmissionSeriesYear } from '../utils/lateralBatch.util.js';
@@ -2701,6 +2702,26 @@ export const saveJoiningDraft = async (req, res) => {
         );
       }
     }
+
+    if (payload.admissionPhase !== undefined || payload.phase !== undefined) {
+      const rawPhase =
+        payload.admissionPhase !== undefined ? payload.admissionPhase : payload.phase;
+      const phase =
+        rawPhase === undefined || rawPhase === null
+          ? ''
+          : String(rawPhase).trim().match(/^phase\s*([1-5])$/i)?.[1] ||
+            String(rawPhase).trim().match(/^([1-5])$/)?.[1] ||
+            '';
+      if (String(rawPhase ?? '').trim() !== '' && !phase) {
+        return errorResponse(res, 'admissionPhase must be 1, 2, 3, 4, or 5', 400);
+      }
+      finalPayload.leadData = {
+        ...(finalPayload.leadData && typeof finalPayload.leadData === 'object'
+          ? finalPayload.leadData
+          : {}),
+        admissionPhase: phase,
+      };
+    }
     // Self-registration leads keep their source even when a reference is attached.
     if (lead && isSelfRegistrationLead(lead) && finalPayload.leadData && typeof finalPayload.leadData === 'object') {
       finalPayload.leadData.source = SELF_REGISTRATION_SOURCE;
@@ -2930,7 +2951,24 @@ export const saveJoiningDraft = async (req, res) => {
         [joiningIdToUse]
       );
       if (admRows.length > 0) {
-        await persistAdmissionReference1(pool, admRows[0].id, payload.reference1, req.user.id);
+        await persistAdmissionReference1WithHistory(
+          pool,
+          admRows[0].id,
+          payload.reference1,
+          req.user
+        );
+      }
+    }
+
+    if (payload.admissionPhase !== undefined || payload.phase !== undefined) {
+      const [admRows] = await pool.execute(
+        'SELECT id FROM admissions WHERE joining_id = ? LIMIT 1',
+        [joiningIdToUse]
+      );
+      if (admRows.length > 0) {
+        const rawPhase =
+          payload.admissionPhase !== undefined ? payload.admissionPhase : payload.phase;
+        await persistAdmissionPhase(pool, admRows[0].id, rawPhase, req.user?.id);
       }
     }
 
