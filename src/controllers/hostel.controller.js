@@ -58,6 +58,52 @@ const formatFeeDoc = (doc) => ({
   description: doc.description || '',
 });
 
+/**
+ * Hostel fee catalogs are keyed by base program (B.Tech), not lateral display labels.
+ * "B.Tech (LATERAL)" → lookup "B.Tech"; year-of-study (2+) selects the fee row.
+ */
+const hostelCourseLookupLabels = (course) => {
+  const raw = String(course || '').trim();
+  if (!raw) return [];
+  const labels = [];
+  const mapped = mapCourseLabel(raw);
+  // Prefer base catalog name first so lateral students hit B.Tech / Diploma configs.
+  if (mapped) labels.push(mapped);
+  if (raw && raw.toLowerCase() !== String(mapped || '').toLowerCase()) {
+    labels.push(raw);
+  }
+  return [...new Set(labels.filter(Boolean))];
+};
+
+const courseRefToIdString = (value) => {
+  if (value == null) return '';
+  if (typeof value === 'object') {
+    if (value._id) return String(value._id).trim();
+    if (typeof value.toHexString === 'function') return value.toHexString();
+  }
+  return String(value).trim();
+};
+
+const isMongoObjectIdString = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || '').trim());
+
+const resolveHostelCourseLabel = async (db, courseRef, cache = new Map()) => {
+  const raw = courseRefToIdString(courseRef);
+  if (!raw) return '';
+  if (!isMongoObjectIdString(raw)) return raw;
+  if (cache.has(raw)) return cache.get(raw);
+
+  const courseDoc = await db.collection('courses').findOne(
+    { _id: toObjectIdOrString(raw) },
+    { projection: { name: 1, courseName: 1, title: 1 } }
+  );
+  const label = String(
+    courseDoc?.name || courseDoc?.courseName || courseDoc?.title || ''
+  ).trim();
+  const resolved = label || raw;
+  cache.set(raw, resolved);
+  return resolved;
+};
+
 const sumHmsFeePortalAmount = (doc) => {
   const termTotal =
     (Number(doc.term1Fee) || 0) +
@@ -74,11 +120,12 @@ const sumHmsFeePortalAmount = (doc) => {
   return Number.isFinite(total) && total > 0 ? total : null;
 };
 
-const formatHmsFeePortalDoc = (doc) => {
+const formatHmsFeePortalDoc = (doc, courseLabel = '') => {
   const course =
-    doc.course && typeof doc.course === 'object'
-      ? String(doc.course)
-      : String(doc.course || '').trim();
+    String(courseLabel || '').trim() ||
+    (doc.course && typeof doc.course === 'object'
+      ? courseRefToIdString(doc.course)
+      : String(doc.course || '').trim());
   return {
     _id: String(doc._id),
     amount: sumHmsFeePortalAmount(doc),
@@ -97,19 +144,15 @@ const loadHostelCategoryName = async (db, categoryId) => {
 };
 
 const buildHmsCourseMatchers = async (db, course) => {
-  const raw = String(course || '').trim();
-  if (!raw) return [];
+  const labels = hostelCourseLookupLabels(course);
+  if (labels.length === 0) return [];
 
-  const labels = new Set([raw]);
-  const mapped = mapCourseLabel(raw);
-  if (mapped) labels.add(mapped);
-
-  const matchers = [...labels].map((label) => new RegExp(`^${escapeRegex(label)}$`, 'i'));
+  const matchers = labels.map((label) => new RegExp(`^${escapeRegex(label)}$`, 'i'));
 
   const courseDocs = await db
     .collection('courses')
     .find({
-      $or: [...labels].flatMap((label) => [
+      $or: labels.flatMap((label) => [
         { name: new RegExp(`^${escapeRegex(label)}$`, 'i') },
         { courseName: new RegExp(`^${escapeRegex(label)}$`, 'i') },
         { title: new RegExp(`^${escapeRegex(label)}$`, 'i') },
@@ -126,19 +169,14 @@ const buildHmsCourseMatchers = async (db, course) => {
 };
 
 const buildCourseRegexes = (courseName) => {
-  const labels = new Set();
-  const raw = String(courseName || '').trim();
-  if (!raw) return [];
-  labels.add(raw);
-  const mapped = mapCourseLabel(raw);
-  if (mapped) labels.add(mapped);
-  return [...labels].map((label) => new RegExp(`^${escapeRegex(label)}$`, 'i'));
+  const labels = hostelCourseLookupLabels(courseName);
+  return labels.map((label) => new RegExp(`^${escapeRegex(label)}$`, 'i'));
 };
 
 const filterFeeDocsByCourse = (docs, courseName) => {
   if (!courseName || !Array.isArray(docs) || docs.length === 0) return docs;
   const labels = new Set(
-    [String(courseName).trim(), mapCourseLabel(courseName)].filter(Boolean).map((l) => l.toLowerCase())
+    hostelCourseLookupLabels(courseName).map((l) => l.toLowerCase())
   );
   const filtered = docs.filter((doc) => {
     const course = String(doc.course || '').trim().toLowerCase();
@@ -236,11 +274,18 @@ const findHmsFeePortalDocs = async (db, { categoryId, academicYear, course }) =>
     return { docs: [], resolvedAcademicYear: normalizedYear, matchedBy: 'none' };
   }
 
-  return {
-    docs: portalDocs.map((doc) => ({
-      ...formatHmsFeePortalDoc(doc),
+  const courseLabelCache = new Map();
+  const formattedDocs = [];
+  for (const doc of portalDocs) {
+    const courseLabel = await resolveHostelCourseLabel(db, doc.course, courseLabelCache);
+    formattedDocs.push({
+      ...formatHmsFeePortalDoc(doc, courseLabel),
       _source: 'feestructures',
-    })),
+    });
+  }
+
+  return {
+    docs: formattedDocs,
     resolvedAcademicYear: normalizedYear,
     matchedBy: 'feestructures',
   };
