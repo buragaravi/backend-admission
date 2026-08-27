@@ -94,6 +94,25 @@ const emptyHeadAmounts = () => ({
 });
 
 /**
+ * Paid amount = actual collections only (DEBIT).
+ * CREDIT rows are concessions / adjustments / refunds — never count them as paid.
+ */
+const isDebitPaymentTransaction = (doc) => {
+  const type = String(doc?.transactionType || '')
+    .trim()
+    .toUpperCase();
+  return type === 'DEBIT';
+};
+
+/** Add a payment amount only when the ledger row is a DEBIT collection. */
+const debitPaidAmount = (doc) => {
+  if (!isDebitPaymentTransaction(doc)) return 0;
+  if (String(doc?.status || '').toLowerCase() === 'cancelled') return 0;
+  const amount = Number(doc?.amount) || 0;
+  return amount > 0 ? amount : 0;
+};
+
+/**
  * Resolve Fee Management head ids/codes for Step 4 tuition + other (Special Fee).
  * Matches admission view-details pivot: TUI01 + OTH1 / Special Fee.
  */
@@ -213,13 +232,11 @@ export async function fetchPaidByAdmissionNumbersForStudentYear(
       .toArray();
 
     for (const doc of docs) {
-      if (String(doc.status || '').toLowerCase() === 'cancelled') continue;
-      const amount = Number(doc.amount) || 0;
+      const amount = debitPaidAmount(doc);
       if (amount <= 0) continue;
-      const multiplier = doc.transactionType === 'CREDIT' ? -1 : 1;
       const studentId = String(doc.studentId || '').trim();
       if (!studentId) continue;
-      result.set(studentId, (result.get(studentId) || 0) + amount * multiplier);
+      result.set(studentId, (result.get(studentId) || 0) + amount);
     }
   } catch (error) {
     console.error('[fetchPaidByAdmissionNumbersForStudentYear]', error?.message || error);
@@ -327,13 +344,11 @@ export async function fetchTuitionPaidByAdmissionNumbers(
       .toArray();
 
     for (const doc of docs) {
-      if (String(doc.status || '').toLowerCase() === 'cancelled') continue;
-      const amount = Number(doc.amount) || 0;
+      const amount = debitPaidAmount(doc);
       if (amount <= 0) continue;
-      const multiplier = doc.transactionType === 'CREDIT' ? -1 : 1;
       const studentId = String(doc.studentId || '').trim();
       if (!studentId) continue;
-      result.set(studentId, (result.get(studentId) || 0) + amount * multiplier);
+      result.set(studentId, (result.get(studentId) || 0) + amount);
     }
   } catch (error) {
     console.error('[fetchTuitionPaidByAdmissionNumbers]', error?.message || error);
@@ -434,19 +449,17 @@ export async function fetchTuitionAndOtherAmountsByAdmissionNumbers(
     }
 
     for (const doc of paidDocs) {
-      if (String(doc.status || '').toLowerCase() === 'cancelled') continue;
-      const amount = Number(doc.amount) || 0;
+      const amount = debitPaidAmount(doc);
       if (amount <= 0) continue;
       const studentId = String(doc.studentId || '').trim();
       if (!studentId) continue;
       const bucket = classifyHeadBucket(doc, refs);
       if (!bucket) continue;
-      const multiplier = doc.transactionType === 'CREDIT' ? -1 : 1;
       const entry = result.get(studentId) || {
         tuition: emptyHeadAmounts(),
         other: emptyHeadAmounts(),
       };
-      entry[bucket].paid += amount * multiplier;
+      entry[bucket].paid += amount;
       entry[bucket].hasFeeEntry = true;
       result.set(studentId, entry);
     }

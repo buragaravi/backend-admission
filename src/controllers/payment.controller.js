@@ -418,7 +418,12 @@ export const listFeeManagementTransactions = async (req, res) => {
     }
 
     const conn = await connectFeeManagement();
-    const query = { studentId };
+    const query = {
+      studentId,
+      // Admissions CRM shows collections only — hide Fee Management CREDIT
+      // (concessions / adjustments / refunds).
+      transactionType: { $not: /^credit$/i },
+    };
     if (studentYear) {
       const numericYear = Number(studentYear);
       query.studentYear = Number.isFinite(numericYear) ? { $in: [studentYear, numericYear] } : studentYear;
@@ -430,9 +435,14 @@ export const listFeeManagementTransactions = async (req, res) => {
       .limit(100)
       .toArray();
 
+    // Defense: also drop CREDIT if transactionType was missing from the $not match edge cases.
+    const paymentDocs = docs.filter(
+      (doc) => String(doc.transactionType || '').trim().toUpperCase() !== 'CREDIT'
+    );
+
     const feeHeadIds = [
       ...new Set(
-        docs
+        paymentDocs
           .map((doc) => (doc.feeHead ? String(doc.feeHead) : ''))
           .filter((id) => /^[a-fA-F0-9]{24}$/.test(id))
       ),
@@ -443,14 +453,14 @@ export const listFeeManagementTransactions = async (req, res) => {
         : [];
     const feeHeadById = new Map(feeHeads.map((head) => [String(head._id), head]));
 
-    const transactions = docs.map((doc) =>
+    const transactions = paymentDocs.map((doc) =>
       serializeFeeMongoTransaction(doc, feeHeadById.get(String(doc.feeHead)))
     );
 
     return successResponse(res, {
       transactions,
       data: transactions,
-      total: docs.length,
+      total: transactions.length,
       filters: { studentId, studentYear: studentYear || null },
     });
   } catch (error) {
