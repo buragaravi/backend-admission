@@ -475,6 +475,100 @@ export const generateStudentPortalPassword = () => {
 };
 
 /**
+ * Map CRM qualification merit (boolean / 0|1 / yes|no) → secondary `student_merit_status.merit_status`.
+ * @returns {'yes'|'no'|null} null when value is absent / unknown (caller may skip write)
+ */
+export const mapQualificationMeritToSecondaryStatus = (merit) => {
+  if (merit === undefined || merit === null || merit === '') return null;
+  if (merit === true || merit === 1 || merit === '1') return 'yes';
+  if (merit === false || merit === 0 || merit === '0') return 'no';
+  const s = String(merit).trim().toLowerCase();
+  if (s === 'yes' || s === 'y' || s === 'true') return 'yes';
+  if (s === 'no' || s === 'n' || s === 'false') return 'no';
+  return null;
+};
+
+/**
+ * Upsert secondary `student_merit_status` for (student_id, student_year).
+ * Does not overwrite `remarks`.
+ *
+ * @returns {Promise<{ action: 'inserted'|'updated'|'unchanged'|'skipped', previous: string|null, next: string|null }>}
+ */
+export const upsertStudentMeritStatus = async (
+  secondaryPool,
+  { studentId, studentYear, meritStatus }
+) => {
+  const sid = Number.parseInt(String(studentId ?? ''), 10);
+  const year = Number.parseInt(String(studentYear ?? ''), 10);
+  const next = mapQualificationMeritToSecondaryStatus(meritStatus);
+  if (!Number.isFinite(sid) || sid <= 0) {
+    return { action: 'skipped', previous: null, next };
+  }
+  if (!Number.isFinite(year) || year < 1 || year > 12) {
+    return { action: 'skipped', previous: null, next };
+  }
+  if (next !== 'yes' && next !== 'no') {
+    return { action: 'skipped', previous: null, next: null };
+  }
+
+  const meritCols = await getTableColumnSet(secondaryPool, 'student_merit_status');
+  if (
+    !meritCols.has('student_id') ||
+    !meritCols.has('student_year') ||
+    !meritCols.has('merit_status')
+  ) {
+    return { action: 'skipped', previous: null, next };
+  }
+
+  const [existing] = await secondaryPool.execute(
+    `SELECT id, merit_status FROM student_merit_status
+     WHERE student_id = ? AND student_year = ?
+     LIMIT 1`,
+    [sid, year]
+  );
+
+  if (existing.length === 0) {
+    await secondaryPool.execute(
+      `INSERT INTO student_merit_status (student_id, student_year, merit_status, created_at, updated_at)
+       VALUES (?, ?, ?, NOW(), NOW())`,
+      [sid, year, next]
+    );
+    return { action: 'inserted', previous: null, next };
+  }
+
+  const previous = existing[0].merit_status == null ? null : String(existing[0].merit_status);
+  if (previous === next) {
+    return { action: 'unchanged', previous, next };
+  }
+
+  await secondaryPool.execute(
+    `UPDATE student_merit_status
+     SET merit_status = ?, updated_at = NOW()
+     WHERE student_id = ? AND student_year = ?`,
+    [next, sid, year]
+  );
+  return { action: 'updated', previous, next };
+};
+
+/**
+ * Resolve CRM merit from formatted admission / joining payload and upsert secondary row.
+ */
+export const syncStudentMeritStatusFromAdmission = async (
+  secondaryPool,
+  { studentId, studentYear, admissionData }
+) => {
+  const merit =
+    admissionData?.qualifications?.merit !== undefined
+      ? admissionData.qualifications.merit
+      : admissionData?.qualification_merit;
+  return upsertStudentMeritStatus(secondaryPool, {
+    studentId,
+    studentYear,
+    meritStatus: merit,
+  });
+};
+
+/**
  * Ensure SDMS `student_credentials` row exists (username = admission number).
  * @returns {Promise<{ credentialsCreated: boolean, plainPassword: string|null }>}
  */
@@ -975,10 +1069,40 @@ export const syncToSecondaryDatabase = async (admissionData, admissionNumber, ex
     }
 
     const [studentIdRows] = await secondaryPool.execute(
-      'SELECT id FROM students WHERE admission_number = ? LIMIT 1',
+      'SELECT id, current_year FROM students WHERE admission_number = ? LIMIT 1',
       [resolvedAdmissionNumber]
     );
     const studentId = studentIdRows[0]?.id;
+    const studentYearForMerit =
+      currentYearFromExtras ??
+      (() => {
+        const y = Number.parseInt(String(studentIdRows[0]?.current_year ?? '').trim(), 10);
+        return Number.isFinite(y) && y >= 1 && y <= 12 ? y : 1;
+      })();
+
+    let meritStatusResult = null;
+    if (studentId) {
+      try {
+        meritStatusResult = await syncStudentMeritStatusFromAdmission(secondaryPool, {
+          studentId,
+          studentYear: studentYearForMerit,
+          admissionData,
+        });
+        if (meritStatusResult?.action === 'inserted' || meritStatusResult?.action === 'updated') {
+          console.log(
+            `[secondary-sync] merit ${meritStatusResult.action} for ${resolvedAdmissionNumber} ` +
+              `(student_id=${studentId}, year=${studentYearForMerit}): ` +
+              `${meritStatusResult.previous ?? '∅'} → ${meritStatusResult.next}`
+          );
+        }
+      } catch (meritErr) {
+        console.error(
+          `[secondary-sync] merit status sync failed for ${resolvedAdmissionNumber}:`,
+          meritErr?.message || meritErr
+        );
+      }
+    }
+
     const credentialResult = studentId
       ? await ensureSecondaryStudentCredentials(
           secondaryPool,
@@ -1045,6 +1169,7 @@ export const syncToSecondaryDatabase = async (admissionData, admissionNumber, ex
       ...credentialResult,
       rollNumber: rollNumberResult?.roll_number ?? null,
       feeManagementStudentFeeSync,
+      meritStatus: meritStatusResult,
     };
   } catch (error) {
     console.error('Secondary DB sync failed:', error);

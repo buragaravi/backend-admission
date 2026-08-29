@@ -25,6 +25,8 @@
     "migrate:joining-public-edit-tokens": "node src/scripts-sql/migrateJoiningPublicEditTokens.js",
     "migrate:joining-online-admission-sms-template": "node src/scripts-sql/migrateJoiningOnlineAdmissionSmsTemplate.js",
     "migrate:qualification-merit": "node src/scripts/ensureQualificationMeritColumns.js",
+    "sync:merit-status:dry": "node src/scripts/syncQualificationMeritToSecondary.js --dry-run",
+    "sync:merit-status:apply": "node src/scripts/syncQualificationMeritToSecondary.js --apply",
     "migrate:admission-confirmation-sms-template": "node src/scripts-sql/migrateAdmissionConfirmationSmsTemplate.js",
     "migrate:minimum-fee-configs": "node src/scripts-sql/runMinimumFeeConfigsMigration.js",
     "migrate:parent-portrait-columns": "node src/scripts-sql/runParentPortraitColumnsMigration.js",
