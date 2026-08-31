@@ -713,6 +713,29 @@ export const submitFeeRequest = async (req, res) => {
       userId: req.user?.id,
     });
 
+    // HMS sync immediately after admission number is minted (Step 3 hostel may have been skipped).
+    if (admissionNumber) {
+      try {
+        const { runJoiningFeePortalSync } = await import('./joining.controller.js');
+        await runJoiningFeePortalSync({
+          pool,
+          joiningId,
+          leadId: joining.lead_id || null,
+          studentFeeDetails,
+          registrationExtras: {
+            ...registrationExtras,
+            ...(transportDetails ? { transport_details: transportDetails } : {}),
+          },
+          user: req.user,
+        });
+      } catch (portalSyncErr) {
+        console.error(
+          '[submitFeeRequest] Portal/HMS sync after admission mint failed (fee request still submitted):',
+          portalSyncErr?.message || portalSyncErr
+        );
+      }
+    }
+
     const [existingPending] = await pool.execute(
       `SELECT id FROM fee_requests WHERE joining_id = ? AND status = 'pending_approval' LIMIT 1`,
       [joiningId]
@@ -893,7 +916,12 @@ export const approveFeeRequest = async (req, res) => {
       [JSON.stringify(leadData), req.user.id, joining.id]
     );
 
-    const syncContext = buildJoiningFeeSyncContext(joining, studentFeeDetails, mergedExtras);
+    const syncContext = buildJoiningFeeSyncContext(
+      joining,
+      studentFeeDetails,
+      mergedExtras,
+      request.admission_number || ''
+    );
     await syncJoiningStudentFeeDetailsToFeeMongo({
       joiningId: joining.id,
       leadId: joining.lead_id,

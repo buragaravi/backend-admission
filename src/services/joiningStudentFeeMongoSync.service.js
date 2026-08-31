@@ -868,33 +868,6 @@ export async function syncJoiningStudentFeeDetailsToFeeMongo({
 }) {
   if (!joiningId || typeof joiningId !== 'string') return { lines: [] };
 
-  const uri = process.env.FEE_MANAGEMENT_MONGO_URI?.trim();
-  if (!uri) {
-    console.warn(
-      '[joiningStudentFeeMongoSync] FEE_MANAGEMENT_MONGO_URI not set; skipping Fee DB mirror'
-    );
-    return { lines: [] };
-  }
-
-  let conn;
-  try {
-    conn = await connectFeeManagement();
-  } catch (err) {
-    console.error('[joiningStudentFeeMongoSync] Failed to connect to Fee Management DB:', err);
-    return { lines: [] };
-  }
-  const db = conn.db;
-
-  if (studentFeeDetails && Array.isArray(studentFeeDetails.lines) && studentFeeDetails.lines.length > 0) {
-    try {
-      const feeHeads = await db.collection('feeheads').find({}).toArray();
-      const { normalizeFeeHeadInEntries } = await import('../utils/overallConcessions.util.js');
-      studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
-    } catch (e) {
-      console.warn('[syncJoiningStudentFeeDetailsToFeeMongo] Failed to normalize fee heads:', e.message);
-    }
-  }
-
   const linesIn = Array.isArray(studentFeeDetails?.lines) ? studentFeeDetails.lines : [];
   const batch =
     studentFeeDetails?.batch != null && String(studentFeeDetails.batch).trim() !== ''
@@ -910,89 +883,118 @@ export async function syncJoiningStudentFeeDetailsToFeeMongo({
   let portalLines = [];
   let studentFeesResult = { skipped: true, reason: 'Fee sync not attempted' };
 
-  try {
-
-    const catalogResult = await loadCatalogFeeStructures(db, {
-      course: joiningContext?.course || '',
-      branch: joiningContext?.branch || '',
-      quota: joiningContext?.quota || '',
-      batch: batch || '',
-      intakeBatch: joiningContext?.intakeBatch || '',
-      admissionNumber: joiningContext?.admissionNumber || '',
-      managedBranchId: joiningContext?.managedBranchId || null,
-      studentStatus: joiningContext?.studentStatus || null,
-    });
-    const catalogRows = catalogResult.rows;
-    const resolvedBatch = catalogResult.catalogLookup.resolvedBatch || batch;
-
-    const accommodationFeeHeads = await loadAccommodationFeeHeads(db);
-    const programTotalYears = resolveProgramTotalYearsForFeeSync(
-      joiningContext?.course,
-      joiningContext?.programTotalYears
+  const uri = process.env.FEE_MANAGEMENT_MONGO_URI?.trim();
+  if (!uri) {
+    console.warn(
+      '[joiningStudentFeeMongoSync] FEE_MANAGEMENT_MONGO_URI not set; skipping Fee DB mirror (bus/hostel sync still runs)'
     );
-    const accommodationRows = buildAccommodationCatalogRows(
-      joiningContext?.transportDetails,
-      overrideMap,
-      accommodationFeeHeads,
-      programTotalYears
-    );
+  } else {
+    let conn;
+    try {
+      conn = await connectFeeManagement();
+    } catch (err) {
+      console.error('[joiningStudentFeeMongoSync] Failed to connect to Fee Management DB:', err);
+      conn = null;
+    }
 
-    portalLines = buildPortalLines(catalogRows, accommodationRows, studentFeeDetails);
+    if (conn) {
+      const db = conn.db;
 
-    const coll = conn.db.collection(JOINING_STUDENT_FEE_MONGO_COLLECTION);
-    const transportDetails = joiningContext?.transportDetails || null;
-    const accommodationType = transportDetails?.accommodationType || null;
-    const intakeBatchYear = resolveRequestedFeeBatch({
-      batch,
-      intakeBatch: joiningContext?.intakeBatch,
-      admissionNumber: joiningContext?.admissionNumber,
-    });
-    const transportSessionYear = resolveTransportAcademicYear(
-      transportDetails,
-      intakeBatchYear || batch || ''
-    );
+      if (studentFeeDetails && Array.isArray(studentFeeDetails.lines) && studentFeeDetails.lines.length > 0) {
+        try {
+          const feeHeads = await db.collection('feeheads').find({}).toArray();
+          const { normalizeFeeHeadInEntries } = await import('../utils/overallConcessions.util.js');
+          studentFeeDetails.lines = normalizeFeeHeadInEntries(studentFeeDetails.lines, feeHeads);
+        } catch (e) {
+          console.warn('[syncJoiningStudentFeeDetailsToFeeMongo] Failed to normalize fee heads:', e.message);
+        }
+      }
 
-    if (!shouldPersistFeePortalMirror(catalogRows, accommodationRows)) {
-      await coll.deleteOne({ joiningId });
-    } else {
-      await coll.replaceOne(
-        { joiningId },
-        {
-          joiningId,
-          leadId: leadId && String(leadId).trim() !== '' ? String(leadId).trim() : null,
-          admissionNumber: joiningContext?.admissionNumber || '',
-          studentName: joiningContext?.studentName || '',
+      try {
+        const catalogResult = await loadCatalogFeeStructures(db, {
           course: joiningContext?.course || '',
           branch: joiningContext?.branch || '',
           quota: joiningContext?.quota || '',
-          batch: batch || resolvedBatch,
-          requestedBatch: batch,
-          intakeBatch: intakeBatchYear || null,
-          transportAcademicYear: transportSessionYear || null,
-          batchMatchMode: catalogResult.catalogLookup.batchMatchMode,
-          accommodationType,
-          transportDetails,
-          lines: portalLines,
-          legacyLines: linesIn,
-          updatedAt: new Date(),
-          source: 'admissions_crm',
-        },
-        { upsert: true }
-      );
-    }
+          batch: batch || '',
+          intakeBatch: joiningContext?.intakeBatch || '',
+          admissionNumber: joiningContext?.admissionNumber || '',
+          managedBranchId: joiningContext?.managedBranchId || null,
+          studentStatus: joiningContext?.studentStatus || null,
+        });
+        const catalogRows = catalogResult.rows;
+        const resolvedBatch = catalogResult.catalogLookup.resolvedBatch || batch;
 
-    studentFeesResult = {
-      skipped: true,
-      reason: 'Standard student fee assignment is handled by Fee Management /api/sync/student-fees after SQL student sync',
-      admissionNumber: joiningContext?.admissionNumber || '',
-    };
-  } catch (err) {
-    console.error(
-      '[joiningStudentFeeMongoSync] Fee Mongo mirror failed (SQL save still succeeded):',
-      err?.message || err
-    );
+        const accommodationFeeHeads = await loadAccommodationFeeHeads(db);
+        const programTotalYears = resolveProgramTotalYearsForFeeSync(
+          joiningContext?.course,
+          joiningContext?.programTotalYears
+        );
+        const accommodationRows = buildAccommodationCatalogRows(
+          joiningContext?.transportDetails,
+          overrideMap,
+          accommodationFeeHeads,
+          programTotalYears
+        );
+
+        portalLines = buildPortalLines(catalogRows, accommodationRows, studentFeeDetails);
+
+        const coll = conn.db.collection(JOINING_STUDENT_FEE_MONGO_COLLECTION);
+        const transportDetails = joiningContext?.transportDetails || null;
+        const accommodationType = transportDetails?.accommodationType || null;
+        const intakeBatchYear = resolveRequestedFeeBatch({
+          batch,
+          intakeBatch: joiningContext?.intakeBatch,
+          admissionNumber: joiningContext?.admissionNumber,
+        });
+        const transportSessionYear = resolveTransportAcademicYear(
+          transportDetails,
+          intakeBatchYear || batch || ''
+        );
+
+        if (!shouldPersistFeePortalMirror(catalogRows, accommodationRows)) {
+          await coll.deleteOne({ joiningId });
+        } else {
+          await coll.replaceOne(
+            { joiningId },
+            {
+              joiningId,
+              leadId: leadId && String(leadId).trim() !== '' ? String(leadId).trim() : null,
+              admissionNumber: joiningContext?.admissionNumber || '',
+              studentName: joiningContext?.studentName || '',
+              course: joiningContext?.course || '',
+              branch: joiningContext?.branch || '',
+              quota: joiningContext?.quota || '',
+              batch: batch || resolvedBatch,
+              requestedBatch: batch,
+              intakeBatch: intakeBatchYear || null,
+              transportAcademicYear: transportSessionYear || null,
+              batchMatchMode: catalogResult.catalogLookup.batchMatchMode,
+              accommodationType,
+              transportDetails,
+              lines: portalLines,
+              legacyLines: linesIn,
+              updatedAt: new Date(),
+              source: 'admissions_crm',
+            },
+            { upsert: true }
+          );
+        }
+
+        studentFeesResult = {
+          skipped: true,
+          reason: 'Standard student fee assignment is handled by Fee Management /api/sync/student-fees after SQL student sync',
+          admissionNumber: joiningContext?.admissionNumber || '',
+        };
+      } catch (err) {
+        console.error(
+          '[joiningStudentFeeMongoSync] Fee Mongo mirror failed (SQL save still succeeded):',
+          err?.message || err
+        );
+      }
+    }
   }
 
+  // Always attempt bus/hostel external sync — independent of Fee Management Mongo URI.
   await syncJoiningAccommodationToExternalDbs({
     joiningId,
     leadId,

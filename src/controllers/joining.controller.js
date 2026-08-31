@@ -324,7 +324,7 @@ const resolveProgramTotalYearsFromExtras = (registrationExtras, course = '') => 
   return 4;
 };
 
-const runJoiningFeePortalSync = async ({
+export const runJoiningFeePortalSync = async ({
   pool,
   joiningId,
   leadId,
@@ -3975,6 +3975,38 @@ export const approveJoining = async (req, res) => {
     );
 
     await connection.commit();
+
+    // HMS bus/hostel sync now that admission number exists (Step 3 hostel may have been skipped earlier).
+    try {
+      const [joiningAfterCommit] = await pool.execute(
+        'SELECT lead_id, lead_data FROM joinings WHERE id = ? LIMIT 1',
+        [joining.id]
+      );
+      const row = joiningAfterCommit[0];
+      if (row) {
+        const leadData = parseJoiningLeadData(row.lead_data);
+        const registrationExtras =
+          leadData._joiningRegistrationExtras && typeof leadData._joiningRegistrationExtras === 'object'
+            ? leadData._joiningRegistrationExtras
+            : {};
+        const studentFeeDetails = sanitizeStudentFeeDetailsForDb(
+          leadData._joiningStudentFeeDetails
+        );
+        await runJoiningFeePortalSync({
+          pool,
+          joiningId: joining.id,
+          leadId: joining.lead_id || row.lead_id || null,
+          studentFeeDetails,
+          registrationExtras,
+          user: req.user,
+        });
+      }
+    } catch (portalSyncErr) {
+      console.error(
+        '[approveJoining] Portal/HMS sync after admission mint failed (approval still succeeded):',
+        portalSyncErr?.message || portalSyncErr
+      );
+    }
 
     // Fire-and-forget SMS after commit — gateway failures must not roll back admission.
     // Student welcome must complete before credentials so messages arrive in that order.

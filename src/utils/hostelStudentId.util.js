@@ -53,12 +53,38 @@ export function hostelStudentIdScopeMatches(existingHostelId, prefix, yearSuffix
   return raw.startsWith(`${prefix}${yearSuffix}`);
 }
 
+const normalizeHostelCode = (value) =>
+  String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+
+/** HCMS counter key: hostelseq:{academicYear}:{college}:{course}:{hostel} */
+const buildHcmsCounterId = (academicYear, collegeCode, courseCode, hostelCode) =>
+  `hostelseq:${academicYear}:${collegeCode}:${courseCode}:${hostelCode}`;
+
+/** Atomically allocate the next serial using the same counters collection as HCMS admin registration. */
+async function allocateHcmsSequenceSerial(db, { academicYear, collegeCode, courseCode, hostelCode }) {
+  const counterId = buildHcmsCounterId(academicYear, collegeCode, courseCode, hostelCode);
+  const counters = db.collection('counters');
+  const result = await counters.findOneAndUpdate(
+    { _id: counterId },
+    { $inc: { sequence: 1 } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  const doc = result?.value ?? result;
+  const serial = Number(doc?.sequence);
+  return Number.isFinite(serial) && serial > 0 ? serial : 1;
+}
+
+const escapeRegexPrefix = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /** Helper to find the maximum sequential ID serial already assigned to HostelRequests in this academic year. */
 export async function getMaxHostelSequenceSerialFromRequests(db, { prefix, academicYear }) {
   try {
     const query = {
       academicYear,
-      hostelSequenceId: new RegExp(`^${prefix}\\d+`, 'i'),
+      hostelSequenceId: new RegExp(`^${escapeRegexPrefix(prefix)}\\d+`, 'i'),
     };
 
     const requests = await db.collection('hostelrequests')
@@ -82,8 +108,9 @@ export async function getMaxHostelSequenceSerialFromRequests(db, { prefix, acade
 }
 
 /**
- * Assign the next hostel student id.
- * Supports new canonical format (e.g. PCEBTECHBH001) if collegeCode + courseCode are passed.
+ * Assign the next hostel student id aligned with HCMS:
+ * hostelSequenceId = collegeCode + courseCode + hostelCode + zeroPaddedSeq(3)
+ * Uses HCMS `counters` collection when college/course/hostel codes are available.
  */
 export async function assignHostelStudentId(db, {
   hostelObjectId,
@@ -104,35 +131,91 @@ export async function assignHostelStudentId(db, {
   const hostelDoc = await db.collection('hostels').findOne({
     _id: toObjectIdOrString(hostelObjectId),
   });
-  const prefix = resolveHostelTypePrefix(hostelDoc?.name, gender);
+  const genderPrefix = resolveHostelTypePrefix(hostelDoc?.name, gender);
+  const hostelCodeFromDoc = normalizeHostelCode(hostelDoc?.code) || genderPrefix;
 
-  let finalPrefix = prefix;
-  let finalYearSuffix = yearSuffix;
-  let finalFormat = 'legacy';
+  const cleanCollege = normalizeHostelCode(collegeCode);
+  const cleanCourse = normalizeHostelCode(courseCode);
+  const useHcmsFormat = Boolean(cleanCollege && cleanCourse && hostelCodeFromDoc);
 
-  if (collegeCode && courseCode) {
-    const cleanCollege = String(collegeCode).trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const cleanCourse = String(courseCode).trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-    finalPrefix = `${cleanCollege}${cleanCourse}${prefix}`;
-    finalYearSuffix = '';
-    finalFormat = 'new';
+  if (useHcmsFormat) {
+    const idPrefix = `${cleanCollege}${cleanCourse}${hostelCodeFromDoc}`;
+    const normalizedExisting = String(existingHostelId || '').trim().toUpperCase();
+    const existingPattern = new RegExp(`^${escapeRegexPrefix(idPrefix)}\\d{3}$`, 'i');
+
+    if (existingPattern.test(normalizedExisting)) {
+      const sequence = parseInt(normalizedExisting.slice(idPrefix.length), 10) || 0;
+      return {
+        hostelId: normalizedExisting,
+        hostelSequenceId: normalizedExisting,
+        assigned: false,
+        reusedExisting: true,
+        collegeCode: cleanCollege,
+        courseCode: cleanCourse,
+        hostelCode: hostelCodeFromDoc,
+        prefix: idPrefix,
+        yearSuffix: '',
+        sequence,
+        format: 'hcms',
+      };
+    }
+
+    let nextSerial;
+    try {
+      nextSerial = await allocateHcmsSequenceSerial(db, {
+        academicYear,
+        collegeCode: cleanCollege,
+        courseCode: cleanCourse,
+        hostelCode: hostelCodeFromDoc,
+      });
+    } catch (err) {
+      console.warn('[hostelStudentId] HCMS counter failed; falling back to request scan:', err?.message);
+      const requestsMaxSerial = await getMaxHostelSequenceSerialFromRequests(db, {
+        prefix: idPrefix,
+        academicYear,
+      });
+      nextSerial = requestsMaxSerial + 1;
+    }
+
+    const hostelSequenceId = `${idPrefix}${String(nextSerial).padStart(3, '0')}`;
+    return {
+      hostelId: hostelSequenceId,
+      hostelSequenceId,
+      assigned: true,
+      reusedExisting: false,
+      collegeCode: cleanCollege,
+      courseCode: cleanCourse,
+      hostelCode: hostelCodeFromDoc,
+      prefix: idPrefix,
+      yearSuffix: '',
+      sequence: nextSerial,
+      format: 'hcms',
+    };
   }
 
+  // Legacy BH26001 / GH26001 fallback when college/course codes are unavailable
+  const finalPrefix = genderPrefix;
+  const finalYearSuffix = yearSuffix;
   const normalizedExisting = String(existingHostelId || '').trim();
-  const isExistingValid = finalFormat === 'new'
-    ? new RegExp(`^${finalPrefix}\\d{3}$`, 'i').test(normalizedExisting)
-    : isValidHostelStudentId(normalizedExisting) && hostelStudentIdScopeMatches(normalizedExisting, finalPrefix, finalYearSuffix);
+  const isExistingValid =
+    isValidHostelStudentId(normalizedExisting) &&
+    hostelStudentIdScopeMatches(normalizedExisting, finalPrefix, finalYearSuffix);
 
   if (isExistingValid) {
     const numPart = normalizedExisting.slice(finalPrefix.length);
     const sequence = parseInt(numPart, 10) || 0;
     return {
       hostelId: normalizedExisting.toUpperCase(),
+      hostelSequenceId: normalizedExisting.toUpperCase(),
       assigned: false,
       reusedExisting: true,
+      collegeCode: cleanCollege || null,
+      courseCode: cleanCourse || null,
+      hostelCode: hostelCodeFromDoc,
       prefix: finalPrefix,
       yearSuffix: finalYearSuffix,
       sequence,
+      format: 'legacy',
     };
   }
 
@@ -141,20 +224,21 @@ export async function assignHostelStudentId(db, {
     prefix: searchPrefix,
     academicYear,
   });
-
   const nextSerial = requestsMaxSerial + 1;
-
-  const generatedId = finalFormat === 'new'
-    ? `${finalPrefix}${String(nextSerial).padStart(3, '0')}`
-    : formatHostelStudentId(finalPrefix, finalYearSuffix, nextSerial);
+  const generatedId = formatHostelStudentId(finalPrefix, finalYearSuffix, nextSerial);
 
   return {
     hostelId: generatedId,
+    hostelSequenceId: generatedId,
     assigned: true,
     reusedExisting: false,
+    collegeCode: cleanCollege || null,
+    courseCode: cleanCourse || null,
+    hostelCode: hostelCodeFromDoc,
     prefix: finalPrefix,
     yearSuffix: finalYearSuffix,
     sequence: nextSerial,
+    format: 'legacy',
   };
 }
 

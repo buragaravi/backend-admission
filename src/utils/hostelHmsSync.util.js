@@ -109,6 +109,7 @@ export async function upsertHostelRoomOccupancyHistory(db, {
   roomNumber,
   bedNumber = '',
   lockerNumber = '',
+  hostelRequestId = null,
 }) {
   if (!studentUserId || !academicYear || !hostelId || !categoryId || !roomId) {
     return { skipped: true, reason: 'Missing required occupancy fields' };
@@ -142,6 +143,7 @@ export async function upsertHostelRoomOccupancyHistory(db, {
     expiryReason: 'registration',
     notes: 'Synced from admissions CRM',
     updatedAt: new Date(),
+    ...(hostelRequestId ? { hostelRequestId: toStoredHostelRefId(hostelRequestId) } : {}),
   };
 
   const existing = await db.collection('roomoccupancyhistories').findOne(filter);
