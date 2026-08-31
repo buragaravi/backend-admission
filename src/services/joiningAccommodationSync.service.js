@@ -15,6 +15,7 @@ import {
   toStoredHostelRefId,
   upsertHostelRoomOccupancyHistory,
 } from '../utils/hostelHmsSync.util.js';
+import { isValidCrmRollNumberFormat } from '../utils/studentRollNumber.util.js';
 
 const { Types: { ObjectId } } = mongoose;
 
@@ -37,20 +38,62 @@ const refMatch = (value) => {
   return { $in: [...keys] };
 };
 
+const isSyntheticRollNumber = (value) => {
+  const roll = String(value || '').trim().toUpperCase();
+  return roll.startsWith('ADM-') || roll.startsWith('JOIN-');
+};
+
+/** Legacy CRM sync wrote `ADM-{admissionNumber}` — normalize to plain admission number. */
+const normalizeStoredRollNumber = (value, admissionNumber) => {
+  const roll = String(value || '').trim();
+  if (!roll) return '';
+  const upper = roll.toUpperCase();
+  const adm = String(admissionNumber || '').trim().toUpperCase();
+  if (adm && upper === `ADM-${adm}`) return adm;
+  if (isSyntheticRollNumber(roll)) return '';
+  return upper;
+};
+
+const isInterimAdmissionRoll = (roll, admissionNumber) => {
+  const r = String(roll || '').trim().toUpperCase();
+  const adm = String(admissionNumber || '').trim().toUpperCase();
+  return Boolean(adm && r === adm);
+};
+
+const isRealHostelRollNumber = (roll, admissionNumber) => {
+  const normalized = normalizeStoredRollNumber(roll, admissionNumber);
+  if (!normalized) return false;
+  if (isInterimAdmissionRoll(normalized, admissionNumber)) return false;
+  if (/^20\d{6}$/.test(normalized)) return false;
+  return isValidCrmRollNumberFormat(normalized) || !/^20\d+$/.test(normalized);
+};
+
 /**
  * HMS `users.rollNumber` has a unique index in production.
- * Many admission-time records do not yet have a real roll number, so we must
- * generate a stable non-empty fallback to avoid duplicate `null` key errors.
+ * Before a CRM branch roll (e.g. 26DCSE001) is assigned, use the plain admission
+ * number — never the legacy `ADM-{admissionNumber}` placeholder.
  */
-const resolveHostelRollNumber = ({ joiningContext, existing, admissionNumber, joiningId }) => {
-  const explicit = String(joiningContext?.rollNumber || '').trim();
-  if (explicit) return explicit;
+const resolveHostelRollNumber = ({
+  joiningContext,
+  existing,
+  admissionNumber,
+  joiningId,
+  secondaryRollNumber = '',
+}) => {
+  const adm = String(admissionNumber || '').trim().toUpperCase();
+  const candidates = [
+    joiningContext?.rollNumber,
+    secondaryRollNumber,
+    existing?.rollNumber,
+  ];
 
-  const fromExisting = String(existing?.rollNumber || '').trim();
-  if (fromExisting) return fromExisting;
+  for (const raw of candidates) {
+    const normalized = normalizeStoredRollNumber(raw, admissionNumber);
+    if (!normalized) continue;
+    if (isRealHostelRollNumber(normalized, admissionNumber)) return normalized;
+  }
 
-  const adm = String(admissionNumber || '').trim();
-  if (adm) return `ADM-${adm}`;
+  if (adm) return adm;
 
   const join = String(joiningId || '').trim();
   if (join) return `JOIN-${join}`;
@@ -58,10 +101,29 @@ const resolveHostelRollNumber = ({ joiningContext, existing, admissionNumber, jo
   return undefined;
 };
 
-const isSyntheticRollNumber = (value) => {
-  const roll = String(value || '').trim().toUpperCase();
-  return roll.startsWith('ADM-') || roll.startsWith('JOIN-');
-};
+async function fetchSecondaryRollForAdmission(admissionNumber) {
+  const adm = String(admissionNumber || '').trim();
+  if (!adm) return '';
+
+  try {
+    const { getPool: getSecondaryPool } = await import('../config-sql/database-secondary.js');
+    const pool = getSecondaryPool();
+    const [rows] = await pool.execute(
+      `SELECT r.roll_number, s.pin_no
+       FROM students s
+       LEFT JOIN student_roll_numbers r ON r.student_id = s.id
+       WHERE s.admission_number = ?
+       LIMIT 1`,
+      [adm]
+    );
+    const row = rows?.[0];
+    const roll = normalizeStoredRollNumber(row?.roll_number || row?.pin_no || '', admissionNumber);
+    return isRealHostelRollNumber(roll, admissionNumber) ? roll : '';
+  } catch (err) {
+    console.warn('[joiningAccommodationSync] secondary roll lookup failed:', err?.message || err);
+    return '';
+  }
+}
 
 /** HCMS-aligned user lookup: admission → real roll/PIN → CRM joiningId. */
 const findExistingHmsUser = async (users, { admissionNumber, rollNumber, joiningId }) => {
@@ -109,7 +171,7 @@ const expirePriorActiveHostelRequests = async (hostelrequests, { admissionNumber
 const buildSdmsSnapshot = ({ joiningContext, gender, resolvedRollNumber, studentYear }) => {
   const roll = String(resolvedRollNumber || '').trim().toUpperCase();
   return {
-    sdmsRollNumber: roll && !isSyntheticRollNumber(roll) ? roll : undefined,
+    sdmsRollNumber: isRealHostelRollNumber(roll, joiningContext?.admissionNumber) ? roll : undefined,
     sdmsName: joiningContext.studentName || undefined,
     sdmsGender: gender || undefined,
     sdmsCourse: joiningContext.course || undefined,
@@ -226,11 +288,13 @@ export async function syncJoiningHostelToHmsMongo({ joiningId, leadId, joiningCo
     rollNumber: joiningContext.rollNumber,
     joiningId,
   });
+  const secondaryRollNumber = await fetchSecondaryRollForAdmission(admissionNumber);
   const resolvedRollNumber = resolveHostelRollNumber({
     joiningContext,
     existing: existingUser,
     admissionNumber,
     joiningId,
+    secondaryRollNumber,
   });
 
   let collegeCode = joiningContext?.collegeCode || '';
@@ -557,7 +621,7 @@ export function previewJoiningHostelSync({ joiningId, leadId, joiningContext, po
 
   const previewRollNumber =
     String(joiningContext.rollNumber || '').trim() ||
-    `ADM-${admissionNumber}`;
+    admissionNumber;
   const transportSessionYear = resolveTransportAcademicYear(
     transport,
     joiningContext?.intakeBatch || joiningContext?.batch || ''
