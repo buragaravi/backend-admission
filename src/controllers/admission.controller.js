@@ -3150,6 +3150,118 @@ export const cancelAdmissionById = async (req, res) => {
 };
 
 /**
+ * Re-activate a cancelled admission (status → active) and sync student_status
+ * on the secondary student database (Admission Cancelled → Regular).
+ */
+export const activateAdmissionById = async (req, res) => {
+  try {
+    const { admissionId } = req.params;
+    ensureAdmissionId(admissionId);
+
+    const pool = getPool();
+    const [admissions] = await pool.execute(
+      'SELECT * FROM admissions WHERE id = ?',
+      [admissionId]
+    );
+
+    if (admissions.length === 0) {
+      return errorResponse(res, 'Admission record not found', 404);
+    }
+
+    const admissionData = admissions[0];
+    if (admissionData.status !== ADMISSION_CANCELLED_STATUS) {
+      return errorResponse(
+        res,
+        'Only cancelled admissions can be activated',
+        400
+      );
+    }
+
+    const existingLeadData = parseAdmissionLeadData(admissionData.lead_data);
+    const previousCancellation = existingLeadData?._admissionCancellation || null;
+    const nextLeadData = { ...existingLeadData };
+    delete nextLeadData._admissionCancellation;
+
+    // Preserve prior cancellation for audit while clearing the active cancel banner payload.
+    if (previousCancellation) {
+      const prior = Array.isArray(nextLeadData._admissionCancellationHistory)
+        ? nextLeadData._admissionCancellationHistory
+        : [];
+      nextLeadData._admissionCancellationHistory = [
+        ...prior,
+        {
+          ...previousCancellation,
+          reactivatedAt: new Date().toISOString(),
+          reactivatedBy: req.user.id,
+        },
+      ].slice(-20);
+    }
+
+    await pool.execute(
+      `UPDATE admissions
+       SET status = ?, lead_data = ?, updated_by = ?, updated_at = NOW()
+       WHERE id = ?`,
+      ['active', JSON.stringify(nextLeadData), req.user.id, admissionId]
+    );
+
+    if (admissionData.lead_id) {
+      await pool.execute(
+        `UPDATE leads
+         SET application_status = ?, updated_at = NOW()
+         WHERE id = ?`,
+        ['Admitted', admissionData.lead_id]
+      );
+    }
+
+    const [updated] = await pool.execute(
+      'SELECT * FROM admissions WHERE id = ?',
+      [admissionId]
+    );
+    const formattedAdmission = await formatAdmission(updated[0], pool);
+
+    warnIfSecondaryStudentSyncMissed(
+      'activateAdmissionById',
+      { admissionId, admissionNumber: formattedAdmission.admissionNumber },
+      await syncToSecondaryDatabase(formattedAdmission, formattedAdmission.admissionNumber, {
+        leadId: formattedAdmission.leadId,
+        joiningId: formattedAdmission.joiningId,
+        email: formattedAdmission.leadData?.email || '',
+      })
+    );
+
+    await appendAdmissionApplicationEditHistory(pool, {
+      admissionId,
+      leadId: admissionData.lead_id,
+      userId: req.user.id,
+      userName: req.user.name,
+      kind: 'activated',
+      title: 'Admission activated',
+      description: previousCancellation?.reason
+        ? `Reactivated after cancellation: ${previousCancellation.reason}`
+        : 'Admission moved from Cancelled to Active',
+      statusFrom: ADMISSION_CANCELLED_STATUS,
+      statusTo: 'active',
+    });
+
+    clearAdmissionQueryCache();
+
+    return successResponse(
+      res,
+      formattedAdmission,
+      'Admission activated successfully',
+      200
+    );
+  } catch (error) {
+    console.error('Error activating admission:', error);
+    return errorResponse(
+      res,
+      error.message || 'Failed to activate admission',
+      error.statusCode || 500
+    );
+  }
+};
+
+/**
  * Send the DLT-approved admission confirmation SMS to the student on demand.
  *
  * Wired to "Send Admission SMS" on the admission detail page so staff can

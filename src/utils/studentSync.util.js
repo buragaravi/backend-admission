@@ -122,6 +122,8 @@ export const deriveSecondaryStudentStatus = (admissionStatus, registrationExtras
       return 'Regular';
     }
     if (lower === 'withdrawn') return 'Discontinued';
+    // Admission was reactivated — do not keep a stale cancelled student_status from extras.
+    if (lower === 'admission cancelled') return 'Regular';
     // Lateral entry is intake metadata (batch/semester/year) — not lifecycle student_status on sync.
     if (lower === 'lateral') return 'Regular';
 
@@ -129,7 +131,6 @@ export const deriveSecondaryStudentStatus = (admissionStatus, registrationExtras
     const allowed = new Set([
       'regular',
       'discontinued',
-      'admission cancelled',
       'detained',
       'long absent',
       're-joined',
