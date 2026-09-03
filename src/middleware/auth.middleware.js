@@ -5,6 +5,7 @@ import { hasElevatedAdminPrivileges, isTrueSuperAdmin } from '../utils/role.util
 import {
   canJoiningEditAdmission,
   canJoiningEditReference,
+  canJoiningActivateAdmission,
 } from '../utils/joiningPermissions.util.js';
 
 export const protect = async (req, res, next) => {
@@ -239,6 +240,24 @@ export const requireJoiningEditAdmission = async (req, res, next) => {
   }
 
   return errorResponse(res, 'Access denied. Joining admission edit permission required', 403);
+};
+
+/** Sub Super Admin joining desk: reactivate cancelled admissions (Super Admin always allowed). */
+export const requireJoiningActivateAdmission = async (req, res, next) => {
+  if (!req.user) {
+    return errorResponse(res, 'Not authenticated', 401);
+  }
+
+  try {
+    const targetCollegeId = await resolveTargetCollegeId(req);
+    if (canJoiningActivateAdmission(req.user, targetCollegeId)) {
+      return next();
+    }
+  } catch (error) {
+    console.error('requireJoiningActivateAdmission error:', error);
+  }
+
+  return errorResponse(res, 'Access denied. Activate admission permission required', 403);
 };
 
 // Check if user has specific permission (for future use)
